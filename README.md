@@ -1,81 +1,79 @@
-# Omarchy Snippets
+# Snippets for Omarchy
 
-Alfred-style text snippets inside the Omarchy clipboard picker.
+Alfred-style text snippets inside the Omarchy clipboard picker. Press
+`SUPER + CTRL + V`, type `thanks`, press Enter — `Thanks, Preston` is pasted.
 
-Press `SUPER + CTRL + V`, type `thanks`, press Enter — `Thanks, Preston` is
-pasted. Your snippets sit pinned above the clipboard history, are searched
-alongside it, and never age out of it.
+No accounts. No cloud. Just a JSON file on disk.
 
-![the picker, with snippets pinned above clipboard history](docs/picker.png)
+![Preview](preview.png)
 
-## Why this exists
-
-Omarchy's clipboard history is capped at the 300 most recent entries, so
-seeding it with canned text does not hold — a busy afternoon of copying pushes
-your snippets off the end. This plugin keeps snippets in their own file and
-merges them into the picker at display time, so they are always one search
-away.
+Omarchy's clipboard history is capped at 300 entries, so canned text seeded
+into it gets pushed off the end by an afternoon of copying. Snippets live in
+their own file and are merged into the picker at display time, so they are
+always one search away.
 
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/prohner/omarchy-snippets.git --enable --yes
+omarchy plugin add https://github.com/prohner/omarchy-snippets.git --enable
+omarchy restart shell
 ```
 
-Plugins run as unsandboxed code inside `omarchy-shell`. Drop `--yes` to review
-the source before enabling it — that is the recommended path.
+No keybinding to add and no config to edit. The manifest declares
+`clonedFrom: omarchy.clipboard`, so your existing `SUPER + CTRL + V` opens this
+instead of the built-in picker. The built-in is disabled while this is enabled,
+and comes back when you remove it.
 
-That is the entire install. **No keybinding to add, no config to edit.** The
-plugin declares `"omarchy": { "clonedFrom": "omarchy.clipboard" }` in its
-manifest, and Omarchy's plugin registry routes calls addressed to the built-in
-clipboard to whichever enabled plugin declares that. Your stock
-`SUPER + CTRL + V` binding already runs
-`omarchy-shell shell toggle omarchy.clipboard`, so it lands here instead. The
-built-in clipboard plugin is disabled automatically while this one is enabled.
+Plugins run unsandboxed inside `omarchy-shell`. Drop `--enable` to read the
+code before turning it on.
 
-Uninstalling restores it just as automatically:
+## Usage
 
-```bash
-omarchy plugin remove io.github.prohner.snippets
+- **Open** — `SUPER + CTRL + V`, the same key as always
+- **Search** — start typing; snippets and clipboard history are searched together
+- **Paste** — Enter on the highlighted row
+- **Out of the way until you search** — with an empty box this is the ordinary
+  clipboard picker, snippets sitting below the history. Type anything and the
+  best-matching snippet jumps to the top
+- **Never evicted** — clipboard history rolls over at 300 entries; snippets do not
+- **Edit** — `Ctrl+E` opens the editor: list on the left, trigger and body on
+  the right, notes underneath
+- **Notes** are searchable, shown under the body in the preview, and never pasted
+
+An exact trigger match always wins. Ranking is: exact trigger, trigger prefix,
+trigger substring, body, notes — ties keep the order you wrote them in.
+
+![Editor](docs/editor.png)
+
+## Keyboard
+
+In the picker:
+
+- Type anything to search
+- **Enter** pastes the highlighted entry
+- **Shift+Enter** copies it without pasting
+- **Alt+Enter** edits a snippet, or opens a history entry externally
+- **Ctrl+E** opens the snippet editor
+- **Delete** removes a clipboard entry (snippets are deleted from the editor)
+- **Escape** clears the search, then closes
+
+In the editor:
+
+- **Ctrl+N** new snippet
+- **Ctrl+S** save
+- **Tab / Shift+Tab** move between Trigger, Body, and Notes
+- **Escape** saves and goes back to the picker
+
+## Data
+
+Snippets are stored at:
+
+```
+~/.config/omarchy/snippets.json
 ```
 
-Your `snippets.json` is left alone — it lives in `~/.config/omarchy/`, not in
-the plugin directory, so both removing and updating the plugin leave it
-untouched.
-
-## Keys
-
-In the picker (`SUPER + CTRL + V`):
-
-| Key | Action |
-|-----|--------|
-| *type anything* | search snippets and clipboard history together |
-| `Enter` | paste the highlighted entry |
-| `Shift+Enter` | copy it without pasting |
-| `Alt+Enter` | on a snippet, edit it; on history, open it externally |
-| `Ctrl+E` | open the snippet editor |
-| `Delete` | delete a clipboard entry (snippets are not deleted from here) |
-| `Esc` | clear the search, then close |
-
-In the editor (`Ctrl+E`):
-
-| Key | Action |
-|-----|--------|
-| `Ctrl+N` | new snippet |
-| `Ctrl+S` | save |
-| `Tab` / `Shift+Tab` | move between Trigger, Body, and Notes |
-| `Esc` | save and go back to the picker |
-
-## Editing snippets
-
-`Ctrl+E` opens a master-detail editor in the same window: the snippet list on
-the left, the selected snippet's trigger and body on the right, and a notes
-field below it for recording what a snippet is for. Notes are searchable and
-show under the body in the picker preview.
-
-![the snippet editor](docs/editor.png)
-
-Everything is stored as plain JSON at `~/.config/omarchy/snippets.json`:
+The picker watches that file, so another tool or agent can read and write it.
+Saving from an editor shows up immediately, with no restart.
 
 ```json
 {
@@ -90,29 +88,39 @@ Everything is stored as plain JSON at `~/.config/omarchy/snippets.json`:
 ```
 
 - **trigger** — what you type to find it. Optional; a snippet without one is
-  labeled by the first line of its body.
-- **body** — what gets pasted, newlines and all.
-- **notes** — free text for yourself. Searchable, never pasted.
+  labeled by the first line of its body
+- **body** — what gets pasted, newlines and all
+- **notes** — free text for yourself. Searchable, never pasted
 
-If you would rather use your own editor, the **Open snippets.json in $EDITOR**
-button hands the file to `omarchy-launch-editor` (your Omarchy editor default,
-Neovim unless you changed it). The plugin watches the file, so saving there
-shows up in the picker immediately — no restart. A bare top-level array works
-too, if you are writing the file by hand.
+A bare top-level array works too, if you are writing the file by hand. If the
+file has a syntax error the picker says so in its header rather than silently
+showing an empty library, and your file is not rewritten until you make an edit
+in the editor.
 
-If the file has a syntax error, the picker says so in the header rather than
-silently showing an empty library. Your file is never rewritten until you make
-an edit in the GUI editor.
+The **Open snippets.json in $EDITOR** button hands the file to
+`omarchy-launch-editor`, which respects your Omarchy editor default.
 
-### How search ranks results
+Clipboard history is Omarchy's own file and is not touched by this plugin:
 
-Typing matches triggers, bodies, and notes, but an exact trigger match always
-wins. Without that, searching `sig` would surface a snippet whose notes read
-"casual sign-**off**" ahead of the snippet actually named `sig`. Order is:
-exact trigger, trigger prefix, trigger substring, body, notes — ties keep the
-order you wrote them in.
+```
+~/.local/state/omarchy/clipboard-history.json
+```
 
-Snippets always sort above clipboard history.
+## Remove
+
+```bash
+omarchy plugin remove io.github.prohner.snippets --yes
+omarchy restart shell
+```
+
+That restores the built-in clipboard picker. It does **not** delete
+`~/.config/omarchy/snippets.json`. Remove that file yourself if you want the
+snippets gone too. Updating the plugin never touches it either.
+
+## Requirements
+
+Omarchy 4 with Quickshell. No extra packages — pasting uses the same
+`omarchy-clipboard-paste-text` helper the built-in picker uses.
 
 ## Development
 
@@ -123,37 +131,33 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable io.github.prohner.snippets
 ```
 
-Saving a `.qml` file under `~/.config/omarchy/plugins/` hot-reloads it. **A
-change to `Snippets.js` does not** — the QML engine caches JavaScript imports,
-so run `omarchy restart shell` after editing it. This is easy to lose an hour
-to.
-
-Run the tests with no dependencies:
+Saving a `.qml` file hot-reloads it. **A change to `Snippets.js` does not** —
+the QML engine caches JavaScript imports, so run `omarchy restart shell` after
+editing it.
 
 ```bash
 node test/snippets.test.js
 ```
 
-`Snippets.js` deliberately imports nothing from QML so the search ranking and
-file parsing can be tested in plain node.
+`Snippets.js` imports nothing from QML, so the search ranking and file parsing
+are tested in plain node with no dependencies.
 
 ### Staying current with upstream
 
-`Clipboard.qml` is a fork of Omarchy's built-in clipboard overlay, currently
-tracking **Omarchy 4.0.2-1**. Every deviation from the original is marked with
-a `+snippets` comment, and everything else lives in files upstream does not
-have (`Snippets.js`, `SnippetsEditor.qml`, `SnippetTextArea.qml`). To pick up
-upstream changes:
+`Clipboard.qml` is a fork of Omarchy's built-in clipboard overlay, tracking
+**Omarchy 4.0.2-1**. Every deviation is marked `+snippets`, and all new
+behavior lives in files upstream does not have (`Snippets.js`,
+`SnippetsEditor.qml`, `SnippetTextArea.qml`).
 
 ```bash
 diff -u /usr/share/omarchy/shell/plugins/clipboard/Clipboard.qml Clipboard.qml
 ```
 
-Every hunk should be `+snippets`-marked. Re-copy the upstream file, re-apply
-those hunks, and bump the version noted above. `ClipboardHistory.js` is a
-verbatim copy — replace it wholesale. `capture.sh` is deliberately *not*
-vendored; the plugin points at the copy in `/usr/share/omarchy/`, which also
-keeps its watcher matching the pkill pattern that reaps stale watchers.
+Every hunk should be `+snippets`-marked. To pick up a new release, re-copy the
+upstream file, re-apply those hunks, and bump the version above.
+`ClipboardHistory.js` is a verbatim copy — replace it wholesale. `capture.sh`
+is deliberately not vendored; pointing at the packaged copy keeps the watcher
+matching the pkill pattern that reaps stale watchers.
 
 ## License
 

@@ -148,6 +148,18 @@ function displayRows(snippets, query, limit) {
   return rows
 }
 
+// Interleave the two row lists for display.
+//
+// With an empty query this is still a clipboard picker: history leads and
+// snippets sit underneath, out of the way, so opening and pressing Enter
+// pastes the most recent copy exactly as the built-in picker does. The moment
+// anything is typed the intent is search, so the best-matching snippet leads.
+function mergeRows(snippetRows, historyRows, query) {
+  var snippets = Array.isArray(snippetRows) ? snippetRows : []
+  var history = Array.isArray(historyRows) ? historyRows : []
+  return String(query || "").trim() ? snippets.concat(history) : history.concat(snippets)
+}
+
 function emptySnippet() {
   return { trigger: "", body: "", notes: "" }
 }
@@ -191,6 +203,7 @@ if (typeof module !== "undefined") {
     label: label,
     searchableText: searchableText,
     displayRows: displayRows,
+    mergeRows: mergeRows,
     emptySnippet: emptySnippet,
     addSnippet: addSnippet,
     updateSnippet: updateSnippet,

@@ -196,11 +196,13 @@ Item {
   }
 
   function rebuildDisplay() {
-    // +snippets: snippets sort ahead of history and are not subject to the
-    // 300-entry history cap, so a snippet is always one search away. Both
-    // lists are filtered by the same query string.
-    var snippetRows = Snippets.displayRows(root.snippets, root.filterText, 50)
-    var rows = snippetRows.concat(ClipboardHistory.displayRows(root.history, root.filterText, 50))
+    // +snippets: both lists are filtered by the same query; Snippets.mergeRows
+    // decides which leads (history when the box is empty, snippets once the
+    // user starts searching). Snippets are never subject to the history cap.
+    var rows = Snippets.mergeRows(
+      Snippets.displayRows(root.snippets, root.filterText, 50),
+      ClipboardHistory.displayRows(root.history, root.filterText, 50),
+      root.filterText)
 
     displayModel.clear()
     for (var i = 0; i < rows.length; i++) {

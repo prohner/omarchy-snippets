@@ -71,5 +71,21 @@ eq(S.addSnippet(lib, S.emptySnippet()).length, lib.length + 1, "addSnippet appen
 eq(S.parseSnippets(S.serialize(lib)).length, lib.length, "serialize round-trips through parse")
 eq(S.serialize([{ trigger: "t", body: "a\nb", notes: "" }]).indexOf("\\n") > 0, true, "newlines are escaped, not literal")
 
+
+// --- merge order ------------------------------------------------------------
+// With an empty box the picker stays a clipboard picker: history leads and
+// snippets sit underneath, out of the way. Typing flips it, because then the
+// user is searching and the best-matching snippet should lead.
+var snips = [{ id: "s1" }, { id: "s2" }]
+var hist = [{ id: "h1" }, { id: "h2" }]
+var ids = function(rows) { return rows.map(function(r) { return r.id }) }
+
+eq(ids(S.mergeRows(snips, hist, "")), ["h1", "h2", "s1", "s2"], "empty query puts history first")
+eq(ids(S.mergeRows(snips, hist, "   ")), ["h1", "h2", "s1", "s2"], "whitespace-only query counts as empty")
+eq(ids(S.mergeRows(snips, hist, "x")), ["s1", "s2", "h1", "h2"], "a query puts snippets first")
+eq(ids(S.mergeRows([], hist, "")), ["h1", "h2"], "no snippets is fine")
+eq(ids(S.mergeRows(snips, [], "x")), ["s1", "s2"], "no history is fine")
+eq(ids(S.mergeRows(null, null, "")), [], "null inputs are tolerated")
+
 console.log(failures === 0 ? "\nAll tests passed." : "\n" + failures + " test(s) failed.")
 process.exit(failures === 0 ? 0 : 1)
