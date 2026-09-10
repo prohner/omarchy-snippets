@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "preston.snippets",
+  "name": "Clipboard + Snippets",
+  "version": "0.1.0",
+  "author": "Preston Rohner",
+  "license": "MIT",
+  "description": "The Omarchy clipboard picker with pinned, always-available text snippets and a built-in editor.",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Clipboard.qml"
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.clipboard"
+  }
+}

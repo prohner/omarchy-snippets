@@ -1,0 +1,19 @@
+{
+  "snippets": [
+    {
+      "trigger": "thanks",
+      "body": "Thanks, Preston",
+      "notes": "Casual sign-off for internal mail and chat."
+    },
+    {
+      "trigger": "sig",
+      "body": "Preston Rohner\npreston.rohner@gmail.com",
+      "notes": "Full signature. Multi-line bodies paste with their newlines intact."
+    },
+    {
+      "trigger": "shrug",
+      "body": "¯\\_(ツ)_/¯",
+      "notes": "Backslashes need escaping in JSON — the editor handles that for you."
+    }
+  ]
+}
