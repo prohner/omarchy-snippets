@@ -36,7 +36,7 @@ built-in clipboard plugin is disabled automatically while this one is enabled.
 Uninstalling restores it just as automatically:
 
 ```bash
-omarchy plugin remove preston.snippets
+omarchy plugin remove io.github.prohner.snippets
 ```
 
 Your `snippets.json` is left alone — it lives in `~/.config/omarchy/`, not in
@@ -118,9 +118,9 @@ Snippets always sort above clipboard history.
 
 ```bash
 git clone https://github.com/prohner/omarchy-snippets.git
-ln -s "$PWD/omarchy-snippets" ~/.config/omarchy/plugins/preston.snippets
+ln -s "$PWD/omarchy-snippets" ~/.config/omarchy/plugins/io.github.prohner.snippets
 omarchy-shell shell rescanPlugins
-omarchy plugin enable preston.snippets
+omarchy plugin enable io.github.prohner.snippets
 ```
 
 Saving a `.qml` file under `~/.config/omarchy/plugins/` hot-reloads it. **A

@@ -1,10 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "preston.snippets",
+  "id": "io.github.prohner.snippets",
   "name": "Clipboard + Snippets",
   "version": "0.1.0",
   "author": "Preston Rohner",
   "license": "MIT",
+  "homepage": "https://github.com/prohner/omarchy-snippets",
   "description": "The Omarchy clipboard picker with pinned, always-available text snippets and a built-in editor.",
   "kinds": [
     "overlay"
