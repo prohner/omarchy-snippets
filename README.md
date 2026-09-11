@@ -1,7 +1,8 @@
 # Snippets for Omarchy
 
-Alfred-style text snippets inside the Omarchy clipboard picker. Press
-`SUPER + CTRL + V`, type `thanks`, press Enter — `Thanks, Preston` is pasted.
+Fast text snippets inside the Omarchy clipboard picker. Press
+`SUPER + CTRL + V`, type `new_feature` (your trigger words), press Enter —
+your custom text is pasted.
 
 No accounts. No cloud. Just a JSON file on disk.
 
