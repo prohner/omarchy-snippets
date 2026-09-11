@@ -5,7 +5,10 @@ Alfred-style text snippets inside the Omarchy clipboard picker. Press
 
 No accounts. No cloud. Just a JSON file on disk.
 
-![Preview](preview.png)
+![Snippets in the Omarchy clipboard picker](docs/demo.gif)
+
+The picker opens on your clipboard history as always. Type, and matching
+snippets jump to the top — Enter pastes.
 
 Omarchy's clipboard history is capped at 300 entries, so canned text seeded
 into it gets pushed off the end by an afternoon of copying. Snippets live in
