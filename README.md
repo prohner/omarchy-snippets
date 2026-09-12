@@ -99,7 +99,19 @@ Saving from an editor shows up immediately, with no restart.
 A bare top-level array works too, if you are writing the file by hand. If the
 file has a syntax error the picker says so in its header rather than silently
 showing an empty library, and your file is not rewritten until you make an edit
-in the editor.
+in the editor. It says so too if the file turns out not to be a plain file it
+can read, or if its own helper is not running.
+
+Sizes are bounded, because this file is parsed inside the process that draws
+your desktop: 512 snippets, a 256-character trigger, a 64 KiB body, and 4 KiB of
+notes. A longer value is shortened rather than dropped. The body limit is not
+arbitrary — the body is pasted by handing it to `omarchy-clipboard-paste-text`
+as a single argument, and Linux refuses any argument longer than 128 KiB.
+
+Clipboard entries are bounded the same way, as they are captured: 128 KiB of
+text per copy, and images past 64 MiB are skipped rather than stored half
+written. See [SECURITY.md](SECURITY.md) for why, and for everything else the
+plugin does about running inside an unsandboxed shell.
 
 The **Open snippets.json in $EDITOR** button hands the file to
 `omarchy-launch-editor`, which respects your Omarchy editor default.
@@ -126,6 +138,24 @@ snippets gone too. Updating the plugin never touches it either.
 Omarchy 4 with Quickshell. No extra packages — pasting uses the same
 `omarchy-clipboard-paste-text` helper the built-in picker uses.
 
+`bin/omarchy-snippets-helper` needs to stay executable. It is the only program
+the plugin runs, and everything that touches a process, the clipboard, or the
+disk goes through it; if it cannot start, the picker says so in its header
+instead of looking like an empty clipboard.
+
+## Security
+
+Plugins run unsandboxed inside `omarchy-shell`, so this one keeps the shell
+process down to one job: drawing the picker. It runs exactly one executable and
+opens no files of its own. Validated absolute executables, a built-not-inherited
+environment, caps and deadlines applied where clipboard payloads are produced
+rather than after they arrive, reads and writes performed through a directory
+descriptor opened once and held, a bounded schema, and watchers killed by
+recorded identity rather than by matching a command line.
+
+[SECURITY.md](SECURITY.md) covers each of those, why it is done that way, and
+what it costs you.
+
 ## Development
 
 ```bash
@@ -140,28 +170,45 @@ the QML engine caches JavaScript imports, so run `omarchy restart shell` after
 editing it.
 
 ```bash
-node test/snippets.test.js
+node test/snippets.test.js   # search ranking, parsing, and the schema bounds
+test/helper.test.sh          # the helper, against a sandbox HOME
 ```
 
-`Snippets.js` imports nothing from QML, so the search ranking and file parsing
-are tested in plain node with no dependencies.
+`Snippets.js` imports nothing from QML, so the search ranking, the file parsing,
+and the size bounds are tested in plain node with no dependencies. The helper is
+tested in bash, because what is worth testing about it — descriptor-safe reads,
+atomic writes that a planted symlink cannot redirect, producer-side caps, and
+killing a watcher by recorded identity rather than by resemblance — is exactly
+the part that cannot be reached from QML. Neither suite touches your real
+snippet library, your real clipboard history, or your clipboard.
 
 ### Staying current with upstream
 
 `Clipboard.qml` is a fork of Omarchy's built-in clipboard overlay, tracking
-**Omarchy 4.0.2-1**. Every deviation is marked `+snippets`, and all new
-behavior lives in files upstream does not have (`Snippets.js`,
-`SnippetsEditor.qml`, `SnippetTextArea.qml`).
+**Omarchy 4.0.2-1**. Feature additions live in files upstream does not have
+(`Snippets.js`, `SnippetsEditor.qml`, `SnippetTextArea.qml`, `GuardedWriter.qml`,
+`bin/omarchy-snippets-helper`), and every deviation inside `Clipboard.qml`
+itself carries one of two markers:
+
+- `+snippets` — the snippet feature. Small, and easy to re-apply.
+- `+hardened` — how the overlay reaches processes and files at all. These
+  replace upstream machinery rather than adding to it, and re-applying them is a
+  judgement call, not a copy. [SECURITY.md](SECURITY.md) says what each one
+  replaced and why.
 
 ```bash
 diff -u /usr/share/omarchy/shell/plugins/clipboard/Clipboard.qml Clipboard.qml
 ```
 
-Every hunk should be `+snippets`-marked. To pick up a new release, re-copy the
-upstream file, re-apply those hunks, and bump the version above.
-`ClipboardHistory.js` is a verbatim copy — replace it wholesale. `capture.sh`
-is deliberately not vendored; pointing at the packaged copy keeps the watcher
-matching the pkill pattern that reaps stale watchers.
+Every hunk should carry one of those two markers. To pick up a new release,
+re-copy the upstream file, re-apply the hunks, and bump the version above.
+
+`ClipboardHistory.js` **used to be** a verbatim copy of upstream's and no longer
+is — it has the schema bounds described in [SECURITY.md](SECURITY.md). Diff it
+against upstream before replacing it wholesale, or the bounds go with it.
+
+`capture.sh` is still deliberately not vendored. The helper runs the packaged
+copy, after validating it, with the payload capped and a deadline on it.
 
 ## License
 

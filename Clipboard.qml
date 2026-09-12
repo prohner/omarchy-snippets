@@ -16,7 +16,6 @@ import "Snippets.js" as Snippets // +snippets
 Item {
   id: root
 
-  property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property bool opened: false
   property string filterText: ""
   property int selectedIndex: 0
@@ -24,20 +23,52 @@ Item {
   property bool clearConfirmOpen: false
   property var history: []
 
-  property string historyPath: Quickshell.env("HOME") + "/.local/state/omarchy/clipboard-history.json"
-  // +snippets: the snippet library. Config, not state — it is authored by the
-  // user and worth backing up, unlike clipboard history.
-  property string snippetsPath: Quickshell.env("HOME") + "/.config/omarchy/snippets.json"
   property var snippets: [] // +snippets
   property bool editorOpen: false // +snippets
   // +snippets: set when snippets.json exists but does not parse. Surfaced in
   // the picker so a typo in a hand-edited file is visible instead of silently
   // showing an empty library.
   property bool snippetsBroken: false
-  // +snippets: pointing at the upstream script keeps this fork from carrying a
-  // copy of capture.sh, and makes the watcher match initProc's pkill pattern
-  // so stale watchers from a previous shell are still reaped correctly.
-  property string captureScript: root.omarchyPath + "/shell/plugins/clipboard/capture.sh"
+  // +hardened: set when the helper reports the file is there but is not a
+  // plain file this user owns — a fifo, a device, a symlink out of the
+  // directory. A different failure from a syntax error, and worth saying so.
+  property bool snippetsUnreadable: false
+  // +hardened: set when the long-lived helper processes keep dying. Without it
+  // a broken install looks exactly like an empty clipboard.
+  property bool helperFailing: false
+
+  // +hardened: this plugin runs exactly one executable, and finds it from this
+  // file's own location rather than from $PATH or $OMARCHY_PATH. Every
+  // external program it runs, every byte it reads from disk, and every byte it
+  // writes to disk goes through that one file, which is where the executable
+  // validation, the size caps, and the atomic writes live. Neither of the two
+  // JSON paths appears here any more: the shell process no longer opens them,
+  // so it no longer has to be the thing that decides they are safe to open.
+  // See SECURITY.md.
+  readonly property string pluginDir: root.localDir(Qt.resolvedUrl("."))
+  readonly property string helper: root.pluginDir + "/bin/omarchy-snippets-helper"
+
+  // +hardened: the environment every child gets. Built by name from the list
+  // below rather than inherited whole, and PATH is stated here rather than
+  // passed through, so nothing a child goes on to run can be chosen by
+  // something that was already in the shell's environment.
+  readonly property var inheritedEnvironment: [
+    "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
+    "XDG_RUNTIME_DIR", "XDG_STATE_HOME", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP",
+    "WAYLAND_DISPLAY", "DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE",
+    "DBUS_SESSION_BUS_ADDRESS", "OMARCHY_PATH"
+  ]
+  readonly property var childEnvironment: root.buildEnvironment()
+
+  // +hardened: the header line. A plugin that has quietly stopped working looks
+  // exactly like a plugin with nothing to show, so each way it can stop working
+  // gets said out loud, most fundamental first.
+  readonly property string statusHint: root.helperFailing ? "snippets helper is not running"
+    : root.snippetsUnreadable ? "snippets.json could not be read"
+    : root.snippetsBroken ? "snippets.json has a syntax error"
+    : (snippetsWriter.failed || historyWriter.failed) ? "could not save — see the shell log"
+    : "Ctrl+E snippets"
+  readonly property bool statusUrgent: root.statusHint !== "Ctrl+E snippets"
   // Shares the [menu] surface tokens — themes that style the menu also
   // style the clipboard. Selected-row colors composed in the
   // singleton so consumers drop them straight into Rectangle bindings.
@@ -80,6 +111,34 @@ Item {
     else root.open("{}")
   }
 
+  // +hardened: the plugin's own directory, from this file's URL. Percent
+  // decoding matters because a URL spells a space "%20" and a path does not.
+  function localDir(url) {
+    var path = String(url)
+    if (path.indexOf("file://") === 0) path = path.substring(7)
+    try { path = decodeURIComponent(path) } catch (e) {}
+    while (path.length > 1 && path.charAt(path.length - 1) === "/") path = path.substring(0, path.length - 1)
+    return path
+  }
+
+  function buildEnvironment() {
+    var env = { "PATH": "/usr/bin:/bin" }
+    for (var i = 0; i < root.inheritedEnvironment.length; i++) {
+      var name = root.inheritedEnvironment[i]
+      var value = Quickshell.env(name)
+      if (value !== undefined && value !== null && String(value).length > 0) env[name] = String(value)
+    }
+    return env
+  }
+
+  // +hardened: detached launches go through a Process rather than
+  // Quickshell.execDetached(), because a Process carries an environment with
+  // it and the bare call inherits the shell's.
+  function runDetached(args) {
+    detachedProc.command = [root.helper].concat(args)
+    detachedProc.startDetached()
+  }
+
   function normalizeEntry(value) {
     return ClipboardHistory.normalizeEntry(value)
   }
@@ -94,7 +153,41 @@ Item {
   }
 
   function saveHistory() {
-    historyFile.setText(JSON.stringify(root.history.slice(0, root.historyLimit), null, 2) + "\n")
+    historyWriter.submit(JSON.stringify(root.history.slice(0, root.historyLimit), null, 2) + "\n")
+  }
+
+  // +hardened: one line per change arrives from the helper — the file's
+  // contents as a JSON string, "" when it is absent, or null when it is there
+  // but is not a plain file this user owns. Encoding it as JSON is what makes
+  // it one line whatever the file holds, so a file with no newline in it can
+  // never leave the reader waiting on a line that is not coming.
+  function decodeWatchLine(line) {
+    try { return JSON.parse(String(line)) } catch (e) { return null }
+  }
+
+  function onHistoryLine(line) {
+    root.noteWatcherAlive()
+    var raw = root.decodeWatchLine(line)
+    root.loadHistory(raw === null ? "[]" : String(raw))
+  }
+
+  function onSnippetsLine(line) {
+    root.noteWatcherAlive()
+    var raw = root.decodeWatchLine(line)
+    if (raw === null) {
+      root.snippets = []
+      root.snippetsBroken = false
+      root.snippetsUnreadable = true
+      if (root.opened) root.rebuildDisplay()
+      return
+    }
+    root.snippetsUnreadable = false
+    root.loadSnippets(String(raw))
+  }
+
+  function noteWatcherAlive() {
+    watchRestartTimer.backoff = 1000
+    root.helperFailing = false
   }
 
   function addClipboardEntry(entry) {
@@ -121,7 +214,8 @@ Item {
   function saveSnippets(list) {
     root.snippets = Array.isArray(list) ? list : []
     root.snippetsBroken = false
-    snippetsFile.setText(Snippets.serialize(root.snippets))
+    root.snippetsUnreadable = false
+    snippetsWriter.submit(Snippets.serialize(root.snippets))
     if (root.opened) root.rebuildDisplay()
   }
 
@@ -141,12 +235,16 @@ Item {
     return displayModel.count
   }
 
-  // Hands the raw file to the user's editor in a terminal. The FileView below
-  // watches the path, so saving in $EDITOR refreshes the picker with no
-  // further action.
+  // Hands the raw file to the user's editor in a terminal. The helper watches
+  // the path, so saving in $EDITOR refreshes the picker with no further action.
+  //
+  // +hardened: no path is passed and no launcher is named. The helper opens
+  // the snippets file it owns, using the copy of omarchy-launch-editor it
+  // found and validated, so this button cannot be aimed at another file and
+  // cannot reach a launcher of that name that happens to be earlier in $PATH.
   function editSnippetsExternally() {
     root.opened = false
-    Quickshell.execDetached(["omarchy-launch-editor", root.snippetsPath])
+    root.runDetached(["run", "launch-editor"])
   }
   // +snippets end ---------------------------------------------------------
 
@@ -295,11 +393,11 @@ Item {
     // clipboard rather than synthesizing keystrokes, which is both faster and
     // lossless for long or multi-line bodies.
     if (row.entryType === "snippet") {
-      if (row.fullText) Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-paste-text", "--shift-insert", row.fullText])
+      if (row.fullText) root.runDetached(["run", "paste-text", "--shift-insert", row.fullText])
     } else if (row.entryType === "image") {
-      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-paste-file", row.mime, row.path])
+      root.runDetached(["run", "paste-file", row.mime, row.path])
     } else if (row.fullText) {
-      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-paste-text", "--shift-insert", "--history-index", String(row.historyIndex)])
+      root.runDetached(["run", "paste-text", "--shift-insert", "--history-index", String(row.historyIndex)])
     }
   }
 
@@ -307,11 +405,11 @@ Item {
     if (!row) return
     root.opened = false
     if (row.entryType === "snippet") { // +snippets
-      if (row.fullText) Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-paste-text", "--copy-only", row.fullText])
+      if (row.fullText) root.runDetached(["run", "paste-text", "--copy-only", row.fullText])
     } else if (row.entryType === "image") {
-      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-paste-file", "--copy-only", row.mime, row.path])
+      root.runDetached(["run", "paste-file", "--copy-only", row.mime, row.path])
     } else if (row.fullText) {
-      Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-paste-text", "--copy-only", "--history-index", String(row.historyIndex)])
+      root.runDetached(["run", "paste-text", "--copy-only", "--history-index", String(row.historyIndex)])
     }
   }
 
@@ -325,10 +423,10 @@ Item {
       return
     }
     root.opened = false
-    Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-open", "--history-index", String(row.historyIndex)])
+    root.runDetached(["run", "open-entry", "--history-index", String(row.historyIndex)])
   }
 
-  Component.onCompleted: initProc.running = true
+  Component.onCompleted: reapProc.running = true
 
   ListModel { id: displayModel }
 
@@ -337,80 +435,147 @@ Item {
     referenceItem: card
   }
 
-  FileView {
-    id: historyFile
-    path: root.historyPath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.loadHistory(text())
-    onLoadFailed: root.loadHistory("[]")
-    onFileChanged: reload()
+  // +hardened: the object every detached launch borrows. It exists only to
+  // carry the controlled environment, which Quickshell.execDetached() on its
+  // own would not.
+  Process {
+    id: detachedProc
+    environment: root.childEnvironment
+    clearEnvironment: true
+  }
+
+  // +hardened: both files used to be read and written by a FileView here, and
+  // both are now read by a helper that watches them and writes them on this
+  // process's behalf. A FileView reads whatever a path resolves to, all of it,
+  // into this process — the one drawing the desktop — with no way from QML to
+  // first ask whether the path is a plain file, whether it is this user's, or
+  // how much is behind it, and its atomic write has no directory it can hold
+  // on to between the check and the rename. All four of those questions are
+  // answerable from a process that can hold a descriptor, so they are answered
+  // there instead. See SECURITY.md.
+  Process {
+    id: historyWatchProc
+    command: [root.helper, "watch-file", "history"]
+    environment: root.childEnvironment
+    clearEnvironment: true
+    onExited: watchRestartTimer.restart()
+    stdout: SplitParser {
+      onRead: function(line) { root.onHistoryLine(line) }
+    }
   }
 
   // +snippets: watching the file means an edit in $EDITOR (or a sync from
   // another machine) shows up in the picker without restarting the shell.
-  FileView {
-    id: snippetsFile
-    path: root.snippetsPath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.loadSnippets(text())
-    onLoadFailed: root.loadSnippets("")
-    onFileChanged: reload()
-  }
-
-  // Reap watchers left behind by a previous shell instance, then start our
-  // own. The pdeathsig on the watchers makes the kernel kill them whenever
-  // the shell exits, however it exits, so no further lifecycle management.
   Process {
-    id: initProc
-    command: ["pkill", "-f", "wl-paste .*--watch .*/shell/plugins/clipboard/capture\\.sh"]
-    onExited: {
-      currentProc.running = true
-      textWatchProc.running = true
-      imageWatchProc.running = true
+    id: snippetsWatchProc
+    command: [root.helper, "watch-file", "snippets"]
+    environment: root.childEnvironment
+    clearEnvironment: true
+    onExited: watchRestartTimer.restart()
+    stdout: SplitParser {
+      onRead: function(line) { root.onSnippetsLine(line) }
     }
   }
 
+  GuardedWriter {
+    id: historyWriter
+    helper: root.helper
+    kind: "history"
+    environment: root.childEnvironment
+  }
+
+  GuardedWriter {
+    id: snippetsWriter
+    helper: root.helper
+    kind: "snippets"
+    environment: root.childEnvironment
+  }
+
+  // Reap watchers left behind by a previous shell instance, then start our
+  // own. The pdeathsig the helper puts on itself makes the kernel kill the
+  // watchers whenever the shell exits, however it exits, so no further
+  // lifecycle management.
+  //
+  // +hardened: this was `pkill -f "wl-paste .*--watch .*capture\.sh"`, which
+  // kills by resemblance — every process of this user whose command line
+  // happens to match that pattern dies, including one that merely mentions it
+  // in an argument. The helper kills only process groups a previous shell
+  // recorded, and only while the pid, the start time recorded with it, and the
+  // command line all still agree that it is the process that was recorded.
   Process {
-    id: currentProc
-    command: [root.captureScript]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.addClipboardJson(text)
+    id: reapProc
+    command: [root.helper, "reap"]
+    environment: root.childEnvironment
+    clearEnvironment: true
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.helperFailing = true
+      captureOnceProc.running = true
+      textWatchProc.running = true
+      imageWatchProc.running = true
+      historyWatchProc.running = true
+      snippetsWatchProc.running = true
+    }
+  }
+
+  // +hardened: the startup snapshot used to be capture.sh straight into a
+  // StdioCollector that waited for the stream to end, which is to say: hold
+  // everything the clipboard had, for as long as it took, however much it was.
+  // The helper caps the payload and puts a deadline on the capture before
+  // either reaches this process, and frames the result as one line, so this
+  // side is the same newline-delimited reader as the two watchers below.
+  Process {
+    id: captureOnceProc
+    command: [root.helper, "capture-once"]
+    environment: root.childEnvironment
+    clearEnvironment: true
+    stdout: SplitParser {
+      onRead: function(data) { root.addClipboardJson(data) }
     }
   }
 
   Process {
     id: textWatchProc
-    command: ["setpriv", "--pdeathsig", "TERM", "wl-paste", "--type", "text", "--watch", root.captureScript, "text"]
+    command: [root.helper, "watch-clipboard", "text"]
+    environment: root.childEnvironment
+    clearEnvironment: true
     onExited: watchRestartTimer.restart()
     stdout: SplitParser {
-      onRead: function(data) { root.addClipboardJson(data) }
+      onRead: function(data) { root.noteWatcherAlive(); root.addClipboardJson(data) }
     }
   }
 
   Process {
     id: imageWatchProc
-    command: ["setpriv", "--pdeathsig", "TERM", "wl-paste", "--type", "image/png", "--watch", root.captureScript, "image/png"]
+    command: [root.helper, "watch-clipboard", "image/png"]
+    environment: root.childEnvironment
+    clearEnvironment: true
     onExited: watchRestartTimer.restart()
     stdout: SplitParser {
-      onRead: function(data) { root.addClipboardJson(data) }
+      onRead: function(data) { root.noteWatcherAlive(); root.addClipboardJson(data) }
     }
   }
 
   // A watcher that dies takes clipboard history with it, silently: copying still
   // works, the picker still opens, and the old entries are all still there, so
   // nothing recorded until the next shell reload. Bring it back instead.
+  //
+  // +hardened: with a backoff, and saying so once the retries stop being
+  // plausibly transient. A helper that cannot start — the file lost its
+  // executable bit, the plugin folder moved — would otherwise be retried once
+  // a second forever with nothing on screen to explain the empty picker.
   Timer {
     id: watchRestartTimer
-    interval: 1000
+    property int backoff: 1000
+
+    interval: backoff
     repeat: false
     onTriggered: {
+      if (backoff >= 8000) root.helperFailing = true
+      backoff = Math.min(backoff * 2, 30000)
       if (!textWatchProc.running) textWatchProc.running = true
       if (!imageWatchProc.running) imageWatchProc.running = true
+      if (!historyWatchProc.running) historyWatchProc.running = true
+      if (!snippetsWatchProc.running) snippetsWatchProc.running = true
     }
   }
 
@@ -600,9 +765,9 @@ Item {
             textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            text: root.snippetsBroken ? "snippets.json has a syntax error" : "Ctrl+E snippets"
-            color: root.snippetsBroken ? Color.urgent : root.foreground
-            opacity: root.snippetsBroken ? 1 : 0.45
+            text: root.statusHint
+            color: root.statusUrgent ? Color.urgent : root.foreground
+            opacity: root.statusUrgent ? 1 : 0.45
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }

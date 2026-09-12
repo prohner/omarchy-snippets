@@ -1,0 +1,662 @@
+#!/usr/bin/bash
+#
+# omarchy-snippets-helper — the only executable the Snippets overlay launches.
+#
+# Everything this plugin does outside the QML engine goes through here:
+# supervising the clipboard watchers, capturing clipboard payloads, reading and
+# writing the two JSON files, and handing work to Omarchy's own helpers. The
+# point of funnelling it into one file is that the rules below get written once
+# and cannot be forgotten at a call site:
+#
+#   * Every external program is an absolute path inside a trusted directory,
+#     lands on a regular executable file, and is writable only by root or by
+#     this user — by a name only root or this user can repoint. Nothing is a
+#     bare name resolved through an inherited PATH.
+#   * The environment is the fixed allowlist the shell hands us plus
+#     PATH=/usr/bin:/bin, with the loader and interpreter hooks unset.
+#   * Every payload that crosses into the shell is capped in bytes and bounded
+#     in time here, by the producer, before the shell allocates for it.
+#   * The two JSON files are reached through a descriptor to their directory
+#     that is opened once and retained, so no component of the path can be
+#     swapped afterwards to redirect a read or a write, and reads are validated
+#     on the descriptor actually being read rather than on a name.
+#   * Stale watchers are killed by recorded (pid, start time, cmdline) identity.
+#     Nothing here ever matches a command line with a pattern.
+#
+# Usage: omarchy-snippets-helper <subcommand> [args…]
+#
+#   reap                        kill watchers recorded by a previous shell
+#   watch-clipboard <type>      supervise a wl-paste watcher for text|image/png
+#   capture-once                snapshot the current clipboard, once
+#   capture-stream <mime>       invoked by wl-paste; caps one clipboard payload
+#   watch-file <snippets|history>   emit the file on every change
+#   write-file <snippets|history>   atomically write the file from stdin
+#   run <helper> [args…]        exec a named Omarchy helper, validated
+#
+# See SECURITY.md for the reasoning behind each of these.
+
+set -u
+set -o pipefail
+
+# ---------------------------------------------------------------------------
+# Controlled environment
+# ---------------------------------------------------------------------------
+# Anything below that survives into a child is here on purpose. The unsets
+# cover the hooks that turn a trusted binary into an attacker-chosen one:
+# bash's startup files, the dynamic loader's preload and path overrides, and
+# perl's include path — capture.sh runs perl.
+IFS=$' \t\n'
+umask 077
+unset -v BASH_ENV ENV CDPATH GLOBIGNORE POSIXLY_CORRECT \
+  LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG LD_ASSUME_KERNEL \
+  PERL5LIB PERL5OPT PERLLIB PERL5DB PERLIO PERL_UNICODE 2>/dev/null
+unset -f cat head stat mv rm mkdir mktemp jq sleep timeout tr kill printf 2>/dev/null
+export PATH=/usr/bin:/bin
+
+readonly SELF_UID=$EUID
+readonly SELF_PATH=${BASH_SOURCE[0]}
+
+# ---------------------------------------------------------------------------
+# Limits — every one of these bounds something that reaches the shell process
+# ---------------------------------------------------------------------------
+readonly MAX_CLIP_TEXT_BYTES=131072        # 128 KiB of clipboard text per copy
+readonly MAX_CLIP_IMAGE_BYTES=67108864     # 64 MiB of clipboard image per copy
+readonly MAX_CAPTURE_OUTPUT_BYTES=1048576  # 1 MiB of JSON out of capture.sh
+readonly MAX_FILE_BYTES=8388608            # 8 MiB per JSON file read or written
+readonly MAX_ARGV_BYTES=131072             # 128 KiB of arguments handed onward,
+                                           # the kernel's own per-argument ceiling
+readonly CAPTURE_DEADLINE=10               # seconds any one capture may take
+readonly POLL_INTERVAL=1                   # seconds between file-change polls
+
+readonly WATCHERS_FILE=watchers
+
+readonly SENTINEL_UNREADABLE=null
+readonly SENTINEL_ABSENT='""'
+
+die() {
+  printf 'omarchy-snippets-helper: %s\n' "$*" >&2
+  exit 1
+}
+
+# Set by whichever subcommand creates a temporary file. The EXIT trap that
+# removes it runs after the function that set it has already returned, so this
+# is a global with a default rather than a local that would be gone by then.
+SCRATCH_FILE=
+
+drop_scratch() {
+  [[ -n ${SCRATCH_FILE:-} ]] && "$RM" -f -- "$SCRATCH_FILE" 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Executable identity
+# ---------------------------------------------------------------------------
+# The directories a trusted executable may live in. Deliberately not derived
+# from PATH, and deliberately not including any directory under $HOME: this
+# plugin never needs to run something the user dropped in ~/.local/bin.
+readonly TRUSTED_BIN_DIRS=(/usr/bin /bin /usr/local/bin)
+
+STAT=
+
+# A program is usable only if it is a regular, executable file that nobody but
+# root or this user can rewrite, reached by a name that nobody else can
+# repoint. The first two tests are shell builtins so that stat(1) itself can be
+# vetted before it is trusted for the ownership and mode tests.
+#
+# A symlink is allowed, because Omarchy's own bin directory is a directory of
+# root-owned symlinks into /usr/bin and refusing those would refuse every
+# helper this plugin legitimately calls. What is checked instead is that the
+# link, the directory holding it, and the file it lands on are all beyond the
+# reach of anyone but root and this user — which is the property that actually
+# matters, and the one a plain "no symlinks" rule only approximates.
+_safe_exec() {
+  local path=$1 owner mode link_owner dir dir_owner dir_mode
+  [[ $path == /* ]] || return 1
+  [[ -f $path && -x $path ]] || return 1
+  [[ -n $STAT ]] || return 0
+
+  IFS='|' read -r owner mode < <("$STAT" -L -c '%u|%a' -- "$path" 2>/dev/null) || return 1
+  [[ $owner == 0 || $owner == "$SELF_UID" ]] || return 1
+  (( (8#$mode & 8#022) == 0 )) || return 1
+
+  link_owner=$("$STAT" -c '%u' -- "$path" 2>/dev/null) || return 1
+  [[ $link_owner == 0 || $link_owner == "$SELF_UID" ]] || return 1
+
+  dir=${path%/*}
+  [[ -n $dir ]] || dir=/
+  IFS='|' read -r dir_owner dir_mode < <("$STAT" -L -c '%u|%a' -- "$dir" 2>/dev/null) || return 1
+  [[ $dir_owner == 0 || $dir_owner == "$SELF_UID" ]] || return 1
+  # A sticky world-writable directory such as /tmp fails here, as it should.
+  (( (8#$dir_mode & 8#022) == 0 )) || return 1
+  return 0
+}
+
+_bootstrap_stat() {
+  local dir
+  for dir in "${TRUSTED_BIN_DIRS[@]}"; do
+    if _safe_exec "$dir/stat"; then STAT=$dir/stat; break; fi
+  done
+  [[ -n $STAT ]] || die "no usable stat(1) in ${TRUSTED_BIN_DIRS[*]}"
+  # Now that ownership and mode can be checked, hold stat to the same bar.
+  _safe_exec "$STAT" || die "refusing to trust $STAT"
+}
+_bootstrap_stat
+
+# tool <name> — prints the validated absolute path, or fails quietly.
+# It never calls die(), because a die() inside $( ) only ends the substitution's
+# subshell: the caller would carry on with an empty program name.
+tool() {
+  local name=$1 dir
+  for dir in "${TRUSTED_BIN_DIRS[@]}"; do
+    if _safe_exec "$dir/$name"; then printf '%s\n' "$dir/$name"; return 0; fi
+  done
+  return 1
+}
+
+# need <var> <name> — resolve a required program into <var>, or die here, in
+# the shell that actually has to stop.
+need() {
+  local __var=$1 __name=$2 __path
+  __path=$(tool "$__name") \
+    || die "no trusted executable named '$__name' in ${TRUSTED_BIN_DIRS[*]}"
+  printf -v "$__var" '%s' "$__path"
+}
+
+# Programs resolved lazily, per subcommand, so a missing optional one never
+# stops a subcommand that does not use it.
+JQ= TR= SLEEP= TIMEOUT= TRUNCATE= WL_PASTE= SETPRIV=
+OMARCHY_ROOT=
+
+need CAT cat
+need HEAD head
+need MKDIR mkdir
+need MKTEMP mktemp
+need MV mv
+need RM rm
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+# $HOME-relative, not XDG-relative, because that is where Omarchy's own
+# omarchy-clipboard-paste-text and omarchy-clipboard-open look for the history
+# file. Agreeing with them matters more than honouring XDG_STATE_HOME here.
+HOME_DIR=${HOME:-}
+[[ $HOME_DIR == /* ]] || die "HOME is not an absolute path"
+[[ $HOME_DIR != *$'\n'* ]] || die "HOME contains a newline"
+readonly HOME_DIR
+readonly CONFIG_DIR=$HOME_DIR/.config/omarchy
+readonly STATE_DIR=$HOME_DIR/.local/state/omarchy
+readonly SNIPPETS_NAME=snippets.json
+readonly HISTORY_NAME=clipboard-history.json
+
+# Watcher identity lives in the runtime directory when there is one: it is
+# private, on tmpfs, and emptied at logout, so a record can never outlive the
+# session that made it. Falling back into the state directory keeps a
+# session without XDG_RUNTIME_DIR working.
+if [[ -n ${XDG_RUNTIME_DIR:-} && ${XDG_RUNTIME_DIR} == /* ]]; then
+  readonly RUNTIME_DIR=$XDG_RUNTIME_DIR/omarchy-snippets
+else
+  readonly RUNTIME_DIR=$STATE_DIR/snippets-runtime
+fi
+
+# resolve_omarchy_root — an absolute, real, non-symlinked Omarchy tree.
+# $OMARCHY_PATH is honoured (a dev checkout is a legitimate install) but it is
+# only a candidate: it has to survive the same checks as the packaged default,
+# and every individual program taken out of it is validated again by _safe_exec.
+need_omarchy_root() {
+  [[ -z $OMARCHY_ROOT ]] || return 0
+  local candidate
+  for candidate in "${OMARCHY_PATH:-}" /usr/share/omarchy; do
+    [[ $candidate == /* ]] || continue
+    [[ $candidate != *..* && $candidate != *$'\n'* ]] || continue
+    [[ -d $candidate && ! -L $candidate ]] || continue
+    [[ -d $candidate/bin && -d $candidate/shell ]] || continue
+    OMARCHY_ROOT=$candidate
+    return 0
+  done
+  die "no usable Omarchy installation (tried \$OMARCHY_PATH and /usr/share/omarchy)"
+}
+
+# ---------------------------------------------------------------------------
+# Retained private directories
+# ---------------------------------------------------------------------------
+DIR_FD=
+DIR_REF=
+
+# open_private_dir <path> — create the directory if it is missing, open it
+# once, and from then on address everything inside it through
+# /proc/self/fd/<fd>. The descriptor pins the inode that was checked, so
+# replacing a component of <path> afterwards cannot redirect a later read,
+# rename, or unlink: the swapped-in directory is simply not the one we hold.
+open_private_dir() {
+  local dir=$1 fd owner mode kind
+  [[ $dir == /* ]] || die "not an absolute path: $dir"
+  [[ $dir != *$'\n'* ]] || die "path contains a newline: $dir"
+
+  if [[ ! -d $dir ]]; then
+    [[ ! -e $dir && ! -L $dir ]] || die "in the way and not a directory: $dir"
+    "$MKDIR" -m 700 -p -- "$dir" || die "cannot create $dir"
+  fi
+  [[ ! -L $dir ]] || die "refusing to use a symlinked directory: $dir"
+
+  exec {fd}< "$dir" || die "cannot open $dir"
+  DIR_FD=$fd
+  DIR_REF=/proc/self/fd/$fd
+
+  IFS='|' read -r kind owner mode < <("$STAT" -L -c '%F|%u|%a' -- "$DIR_REF" 2>/dev/null) \
+    || die "cannot stat $dir"
+  [[ $kind == "directory" ]] || die "not a directory: $dir"
+  [[ $owner == "$SELF_UID" ]] || die "$dir is not owned by this user"
+  (( (8#$mode & 8#022) == 0 )) || die "$dir is writable by group or other"
+}
+
+FILE_FD=
+
+# open_checked_file <name> — open <name> inside the retained directory and
+# validate the descriptor that was actually opened, not the name that was used
+# to open it. Returns 0 with FILE_FD set, 2 when the file is absent, 1 when it
+# is present but is not a plain file this user owns.
+#
+# The type is tested before the open and again on the descriptor afterwards,
+# and both tests earn their place. The one before matters because open(2) on a
+# fifo blocks until a writer arrives: a watcher that opened one would stop
+# reporting forever, with nothing to show for it. The one after matters because
+# the name is not what gets read — the descriptor is — and only the descriptor
+# can say what was really on the other end of it.
+open_checked_file() {
+  local name=$1 fd kind owner
+  if [[ ! -e $DIR_REF/$name ]]; then
+    # A dangling symlink is not an absent file; it is a planted one.
+    [[ -L $DIR_REF/$name ]] && return 1
+    return 2
+  fi
+  [[ ! -L $DIR_REF/$name ]] || return 1
+  [[ -f $DIR_REF/$name ]] || return 1
+
+  exec {fd}< "$DIR_REF/$name" 2>/dev/null || return 1
+  IFS='|' read -r kind owner < <("$STAT" -L -c '%F|%u' -- "/proc/self/fd/$fd" 2>/dev/null) || {
+    exec {fd}<&-
+    return 1
+  }
+  if [[ $kind != "regular file" || $owner != "$SELF_UID" ]]; then
+    exec {fd}<&-
+    return 1
+  fi
+  FILE_FD=$fd
+  return 0
+}
+
+# emit_file <name> — one line on stdout: the file's contents as a JSON string
+# literal, "" when it is absent, or null when it is unreadable. JSON-encoding
+# it means the payload is always exactly one newline-terminated line no matter
+# what the file holds, so the reader's line splitter can never be starved by
+# content that happens to contain no newline.
+emit_file() {
+  local name=$1 rc=0
+  open_checked_file "$name" || rc=$?
+  case $rc in
+    0)
+      "$HEAD" -c "$MAX_FILE_BYTES" <&"$FILE_FD" | "$JQ" -Rs .
+      exec {FILE_FD}<&-
+      ;;
+    2) printf '%s\n' "$SENTINEL_ABSENT" ;;
+    *) printf '%s\n' "$SENTINEL_UNREADABLE" ;;
+  esac
+}
+
+# file_signature <name> — cheap identity of the file as it is right now.
+# The inode covers atomic replacement, size and nanosecond mtime cover an
+# in-place edit.
+file_signature() {
+  "$STAT" -c '%d:%i:%s:%.9Y' -- "$DIR_REF/$1" 2>/dev/null || printf -- '-'
+}
+
+# ---------------------------------------------------------------------------
+# Bounded input
+# ---------------------------------------------------------------------------
+# read_capped <dest> <max> — copy at most <max> bytes of stdin into <dest>,
+# then read the rest away. Draining matters: stopping at the cap and closing
+# would SIGPIPE the producer, which for wl-paste means a broken watcher rather
+# than a truncated entry.
+read_capped() {
+  local dest=$1 max=$2
+  "$HEAD" -c "$max" > "$dest"
+  "$CAT" > /dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Process identity
+# ---------------------------------------------------------------------------
+# proc_starttime <pid> — field 22 of /proc/<pid>/stat, the clock tick the
+# process was started at. Together with the pid it is a name the kernel cannot
+# hand to anybody else: a recycled pid has a different start time.
+proc_starttime() {
+  local pid=$1 line rest
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  [[ -r /proc/$pid/stat ]] || return 1
+  line=$(< "/proc/$pid/stat") || return 1
+  [[ $line == *') '* ]] || return 1
+  rest=${line#*') '}          # drop "pid (comm) ", whatever comm contains
+  set -f
+  set -- $rest                # $1 is field 3 (state), so field 22 is $20
+  set +f
+  [[ ${20:-} =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${20}"
+}
+
+# proc_is_ours <pid> — the process must name this very helper on its command
+# line. This is the second half of the identity check, and the reason nothing
+# here needs to kill by pattern: we are not asking "does this look like a
+# clipboard watcher", we are asking "is this the process we started".
+proc_is_ours() {
+  local pid=$1 cmd
+  [[ -r /proc/$pid/cmdline ]] || return 1
+  cmd=$("$TR" '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null) || return 1
+  [[ $cmd == *"$SELF_PATH"* ]]
+}
+
+record_identity() {
+  local kind=$1 pid=$2 start
+  start=$(proc_starttime "$pid") || return 0
+  printf '%s %s %s\n' "$kind" "$pid" "$start" >> "$DIR_REF/$WATCHERS_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+# reap — terminate the watchers a previous shell left behind.
+#
+# The old implementation was `pkill -f 'wl-paste .*--watch .*capture\.sh'`,
+# which kills by resemblance: any process of this user whose command line
+# happens to match that pattern dies, including one that merely mentions it.
+# This kills only process groups we recorded ourselves, and only while the pid,
+# its start time, and its command line all still agree.
+cmd_reap() {
+  need TR tr
+  open_private_dir "$RUNTIME_DIR"
+
+  local record=$DIR_REF/$WATCHERS_FILE kind pid start now
+  if [[ -f $record ]]; then
+    while read -r kind pid start; do
+      [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || continue
+      now=$(proc_starttime "$pid") || continue
+      [[ $now == "$start" ]] || continue
+      proc_is_ours "$pid" || continue
+      case $kind in
+        group) kill -TERM -- "-$pid" 2>/dev/null ;;
+        proc) kill -TERM -- "$pid" 2>/dev/null ;;
+      esac
+    done < "$record"
+  fi
+  : > "$DIR_REF/$WATCHERS_FILE"
+}
+
+# bind_to_shell <subcommand> [args…] — re-exec through setpriv so the kernel
+# sends this process SIGTERM the moment the shell that started it exits, however
+# it exits. setpriv keeps our pid and our parent, so the death signal is bound
+# to the shell and not to setpriv, and it is set on the last exec in the chain
+# because a fork would clear it.
+bind_to_shell() {
+  [[ ${SNIPPETS_PDEATHSIG:-} != 1 ]] || return 0
+  need SETPRIV setpriv
+  export SNIPPETS_PDEATHSIG=1
+  exec "$SETPRIV" --pdeathsig TERM -- "$SELF_PATH" "$@"
+}
+
+# record_own_identity — note this process in the watcher record before it
+# opens anything else, so that a shell which comes back after this one was
+# killed outright can still name it. Leaves the retained directory pointing at
+# the runtime directory; callers open their own afterwards.
+record_own_identity() {
+  need TR tr
+  open_private_dir "$RUNTIME_DIR"
+  record_identity proc "$$"
+}
+
+WATCH_CHILD=
+
+stop_watch_child() {
+  trap - TERM INT HUP EXIT
+  if [[ -n $WATCH_CHILD ]]; then
+    kill -TERM -- "-$WATCH_CHILD" 2>/dev/null
+  fi
+  exit 0
+}
+
+# watch-clipboard <text|image/png> — supervise one wl-paste watcher.
+#
+# Three separate things have to fail before a watcher outlives the shell. The
+# kernel kills this supervisor when the shell exits, because the re-exec below
+# asks it to. The kernel kills wl-paste when this supervisor dies, for any
+# reason at all, because the launch below asks it to as well. And this
+# supervisor kills the whole wl-paste process group on the way out, which is
+# what catches the per-event capture children. `reap` is what remains for the
+# case where all of that was somehow bypassed.
+cmd_watch_clipboard() {
+  local mime=${1:-}
+  case $mime in
+    text | image/png) ;;
+    *) die "watch-clipboard takes 'text' or 'image/png'" ;;
+  esac
+
+  bind_to_shell watch-clipboard "$mime"
+
+  need WL_PASTE wl-paste
+  need SETPRIV setpriv
+  record_own_identity
+
+  # Job control gives the background job a process group of its own, whose id
+  # is its pid — so the group can be named, recorded, and later killed whole,
+  # including the capture children wl-paste spawns per event.
+  #
+  # The death signal goes on wl-paste as well as on this supervisor, and not
+  # merely because two are better than one. The supervisor's trap can only run
+  # if the supervisor is asked to stop; a shell that kills its children outright
+  # on the way out — which Quickshell does — never gives it the chance, and the
+  # watcher is left running with nothing above it. Asking the kernel to do it
+  # needs no cooperation from anybody.
+  set -m
+  "$SETPRIV" --pdeathsig TERM -- \
+    "$WL_PASTE" --type "$mime" --watch "$SELF_PATH" capture-stream "$mime" &
+  WATCH_CHILD=$!
+  set +m
+
+  record_identity group "$WATCH_CHILD"
+  trap stop_watch_child TERM INT HUP EXIT
+  wait "$WATCH_CHILD"
+}
+
+# capture_payload <mime> — the one place a clipboard payload becomes a line of
+# JSON, and the one place its size and its running time are bounded.
+#
+# Text over the cap is truncated: a shortened entry is still useful. An image
+# over the cap is dropped, because half a PNG on disk is not an image, it is a
+# corrupt file the picker would offer forever.
+capture_payload() {
+  local mime=$1 max tmp size out
+  case $mime in
+    text) max=$MAX_CLIP_TEXT_BYTES ;;
+    image/*) max=$MAX_CLIP_IMAGE_BYTES ;;
+    *) return 0 ;;
+  esac
+
+  need_omarchy_root
+  local capture_script=$OMARCHY_ROOT/shell/plugins/clipboard/capture.sh
+  _safe_exec "$capture_script" || die "refusing to run $capture_script"
+
+  need TIMEOUT timeout
+  need TRUNCATE truncate
+  open_private_dir "$RUNTIME_DIR"
+  tmp=$("$MKTEMP" -- "$DIR_REF/capture.XXXXXXXX") || return 0
+  SCRATCH_FILE=$tmp
+  trap drop_scratch EXIT
+
+  read_capped "$tmp" "$((max + 1))"
+  size=$("$STAT" -L -c '%s' -- "$tmp" 2>/dev/null) || return 0
+  if (( size > max )); then
+    case $mime in
+      image/*) return 0 ;;
+      *) "$TRUNCATE" -s "$max" -- "$tmp" || return 0 ;;
+    esac
+  fi
+
+  # capture.sh still runs its own sensitive-clipboard and password-manager
+  # checks; CLIPBOARD_STATE reaches it because wl-paste sets it on us.
+  out=$("$TIMEOUT" -k 2 "$CAPTURE_DEADLINE" "$capture_script" "$mime" < "$tmp" \
+    | "$HEAD" -c "$MAX_CAPTURE_OUTPUT_BYTES" | "$HEAD" -n 1) || out=
+  [[ -n $out ]] && printf '%s\n' "$out"
+  return 0
+}
+
+# capture-stream <mime> — what wl-paste --watch invokes, with the payload on
+# stdin.
+cmd_capture_stream() {
+  need JQ jq
+  capture_payload "${1:-text}"
+}
+
+# capture-once — the startup snapshot of whatever is already on the clipboard.
+# The type selection mirrors capture.sh's own, but the payload is pulled here
+# so that it goes through the same caps as every later one instead of being
+# read whole inside capture.sh.
+cmd_capture_once() {
+  local types mime
+  need WL_PASTE wl-paste
+  need TIMEOUT timeout
+  need JQ jq
+
+  types=$("$TIMEOUT" 2 "$WL_PASTE" --list-types 2>/dev/null | "$HEAD" -c 8192) || types=
+  [[ -n $types ]] || return 0
+
+  for mime in image/png image/jpeg image/webp image/gif image/bmp image/tiff; do
+    if [[ $'\n'$types$'\n' == *$'\n'$mime$'\n'* ]]; then
+      "$TIMEOUT" "$CAPTURE_DEADLINE" "$WL_PASTE" --type "$mime" 2>/dev/null \
+        | capture_payload "$mime"
+      return 0
+    fi
+  done
+
+  if [[ $types == *text/* ]] \
+    || [[ $'\n'$types$'\n' == *$'\nUTF8_STRING\n'* ]] \
+    || [[ $'\n'$types$'\n' == *$'\nSTRING\n'* ]]; then
+    "$TIMEOUT" "$CAPTURE_DEADLINE" "$WL_PASTE" --type text --no-newline 2>/dev/null \
+      | capture_payload text
+  fi
+  return 0
+}
+
+resolve_managed_file() {
+  case ${1:-} in
+    snippets) MANAGED_DIR=$CONFIG_DIR; MANAGED_NAME=$SNIPPETS_NAME ;;
+    history) MANAGED_DIR=$STATE_DIR; MANAGED_NAME=$HISTORY_NAME ;;
+    *) die "unknown file '${1:-}' (expected 'snippets' or 'history')" ;;
+  esac
+}
+
+# watch-file <snippets|history> — emit the file now, and again on every change.
+#
+# This replaces reading the file from inside the shell process. The shell never
+# opens either path itself, so it never inherits the question of what the path
+# resolves to or how much is behind it: it receives a bounded, already-framed
+# line and nothing else.
+cmd_watch_file() {
+  local signature current
+  resolve_managed_file "${1:-}"
+  bind_to_shell watch-file "$1"
+
+  need JQ jq
+  need SLEEP sleep
+
+  record_own_identity
+  open_private_dir "$MANAGED_DIR"
+
+  trap 'exit 0' TERM INT HUP
+
+  signature=$(file_signature "$MANAGED_NAME")
+  emit_file "$MANAGED_NAME"
+
+  # A poll rather than inotify, on purpose. inotify has to arm a watch after
+  # every event it reports, and a save landing inside that window is not
+  # reported at all — so it needs a timed re-check behind it anyway, which is
+  # the poll, plus a second way for the loop to be wrong. One stat of one file
+  # per second costs nothing measurable and cannot miss a change: the inode
+  # catches a replacement by rename, the size and nanosecond mtime catch an
+  # edit in place.
+  while :; do
+    "$SLEEP" "$POLL_INTERVAL"
+    current=$(file_signature "$MANAGED_NAME")
+    [[ $current == "$signature" ]] && continue
+    signature=$current
+    emit_file "$MANAGED_NAME"
+  done
+}
+
+# write-file <snippets|history> — replace the file with stdin, atomically,
+# inside the directory descriptor we hold.
+#
+# The temporary file is created by mktemp (mode 600) in that same directory, so
+# the rename is a rename and not a copy, and the reader never sees a partial
+# file. Because both the temporary name and the destination name are resolved
+# through the retained descriptor, a directory planted at the path afterwards
+# receives nothing.
+cmd_write_file() {
+  local tmp
+  resolve_managed_file "${1:-}"
+  open_private_dir "$MANAGED_DIR"
+
+  tmp=$("$MKTEMP" -- "$DIR_REF/.$MANAGED_NAME.XXXXXXXX") || die "cannot create a temporary file in $MANAGED_DIR"
+  SCRATCH_FILE=$tmp
+  trap drop_scratch EXIT
+
+  read_capped "$tmp" "$MAX_FILE_BYTES"
+
+  # rename(2) does not follow a symlink at the destination, so a planted link
+  # is replaced by the real file rather than written through.
+  "$MV" -f -- "$tmp" "$DIR_REF/$MANAGED_NAME" || die "cannot write $MANAGED_DIR/$MANAGED_NAME"
+  SCRATCH_FILE=
+  trap - EXIT
+}
+
+# run <helper> [args…] — exec one of Omarchy's own helpers.
+#
+# The name is chosen from a fixed list here rather than passed through, the
+# program is validated like any other, and PATH is rebuilt explicitly instead
+# of inherited, because these helpers go on to call further bare names of their
+# own (wl-copy, wtype, omarchy-launch-tui).
+cmd_run() {
+  local what=${1:-} bin path total=0 arg
+  shift || true
+
+  case $what in
+    paste-text) bin=omarchy-clipboard-paste-text ;;
+    paste-file) bin=omarchy-clipboard-paste-file ;;
+    open-entry) bin=omarchy-clipboard-open ;;
+    launch-editor) bin=omarchy-launch-editor ;;
+    *) die "unknown helper '$what'" ;;
+  esac
+
+  for arg in "$@"; do
+    total=$(( total + ${#arg} + 1 ))
+  done
+  (( total <= MAX_ARGV_BYTES )) || die "arguments exceed $MAX_ARGV_BYTES bytes"
+
+  need_omarchy_root
+  path=$OMARCHY_ROOT/bin/$bin
+  _safe_exec "$path" || die "refusing to run $path"
+
+  export PATH="$OMARCHY_ROOT/bin:$HOME_DIR/.local/bin:/usr/local/bin:/usr/bin:/bin"
+  exec "$path" "$@"
+}
+
+# ---------------------------------------------------------------------------
+case ${1:-} in
+  reap) shift; cmd_reap "$@" ;;
+  watch-clipboard) shift; cmd_watch_clipboard "$@" ;;
+  capture-once) shift; cmd_capture_once "$@" ;;
+  capture-stream) shift; cmd_capture_stream "$@" ;;
+  watch-file) shift; cmd_watch_file "$@" ;;
+  write-file) shift; cmd_write_file "$@" ;;
+  run) shift; cmd_run "$@" ;;
+  *) die "usage: omarchy-snippets-helper <reap|watch-clipboard|capture-once|capture-stream|watch-file|write-file|run> [args…]" ;;
+esac

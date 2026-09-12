@@ -87,5 +87,66 @@ eq(ids(S.mergeRows([], hist, "")), ["h1", "h2"], "no snippets is fine")
 eq(ids(S.mergeRows(snips, [], "x")), ["s1", "s2"], "no history is fine")
 eq(ids(S.mergeRows(null, null, "")), [], "null inputs are tolerated")
 
+
+// --- bounds ------------------------------------------------------------------
+// Both JSON files are ordinary user-writable files under $HOME. Nothing that
+// reaches these parsers has promised to be small, and what they return goes
+// straight into QML models inside the process drawing the whole desktop, so
+// every array and every string is clamped on the way through. New clipboard
+// entries are already capped by bin/omarchy-snippets-helper before the shell
+// sees them; these limits are what catches a file written before that, or by
+// something else entirely.
+var H = require("../ClipboardHistory.js")
+
+function repeat(character, count) { return new Array(count + 1).join(character) }
+
+var tooMany = { snippets: [] }
+for (var n = 0; n < S.limits.snippets + 200; n++) tooMany.snippets.push({ trigger: "t" + n, body: "b" })
+eq(S.parseSnippets(JSON.stringify(tooMany)).length, S.limits.snippets, "snippet count is capped")
+
+var oversized = S.parseSnippets(JSON.stringify({ snippets: [{
+  trigger: repeat("t", S.limits.trigger + 500),
+  body: repeat("b", S.limits.body + 500),
+  notes: repeat("n", S.limits.notes + 500)
+}] }))[0]
+eq(oversized.trigger.length, S.limits.trigger, "trigger length is capped")
+eq(oversized.body.length, S.limits.body, "body length is capped")
+eq(oversized.notes.length, S.limits.notes, "notes length is capped")
+
+// The body cap is not a taste judgement: the body is handed to
+// omarchy-clipboard-paste-text as one argument, and Linux refuses any single
+// argument longer than 128 KiB, so a body above that could not be pasted.
+eq(S.limits.body <= 131072, true, "a capped body still fits in one exec argument")
+
+eq(S.parseSnippets("[" + repeat(" ", S.limits.raw) + "]").length, 0,
+   "a file past the raw size cap is refused without being parsed")
+// Serializing is the other direction over the same cap: a library that arrived
+// oversized must not be written back oversized.
+eq(S.parseSnippets(S.serialize(tooMany.snippets)).length, S.limits.snippets,
+   "serialize writes back no more snippets than the cap allows")
+
+var longHistory = []
+for (var h = 0; h < H.limits.entries + 200; h++) longHistory.push({ type: "text", text: "e" + h })
+eq(H.parseHistory(JSON.stringify(longHistory)).length, H.limits.entries, "history entry count is capped")
+eq(H.normalizeEntry({ type: "text", text: repeat("x", H.limits.text + 500) }).text.length, H.limits.text,
+   "history entry text is capped")
+
+var bigImage = H.normalizeEntry({
+  type: "image",
+  path: repeat("p", H.limits.path + 500),
+  mime: repeat("m", H.limits.mime + 500),
+  capturedAt: repeat("c", 500)
+})
+eq(bigImage.path.length, H.limits.path, "image path is capped")
+eq(bigImage.mime.length, H.limits.mime, "image mime is capped")
+eq(H.parseHistory("[" + repeat(" ", H.limits.raw) + "]").length, 0,
+   "a history file past the raw size cap is refused without being parsed")
+
+// Clamping must not turn a valid entry into a dropped one.
+eq(H.normalizeEntry({ type: "text", text: repeat("x", H.limits.text + 10) }).type, "text",
+   "an oversized entry is shortened, not discarded")
+eq(S.parseSnippets(JSON.stringify({ snippets: [{ trigger: "keep", body: repeat("b", S.limits.body + 10) }] }))[0].trigger,
+   "keep", "an oversized snippet is shortened, not discarded")
+
 console.log(failures === 0 ? "\nAll tests passed." : "\n" + failures + " test(s) failed.")
 process.exit(failures === 0 ? 0 : 1)

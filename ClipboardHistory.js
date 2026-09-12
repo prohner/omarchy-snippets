@@ -1,25 +1,49 @@
+// Bounds
+// ------
+// The history file is ordinary user-writable JSON under $HOME, so nothing
+// upstream of this parser promises it is small — it can be hand-edited, synced
+// in, or left behind by an older version with no caps at all. Every array and
+// every string is therefore clamped before it becomes a model row, because the
+// process doing the allocating is the one drawing the whole desktop.
+//
+// New entries are already capped where they are produced, by
+// bin/omarchy-snippets-helper, before they ever reach the shell. These limits
+// are what catches a file that predates that, or was written by something
+// else. maxEntryTextLength matches the helper's own clipboard text cap.
+var maxHistoryEntries = 300
+var maxEntryTextLength = 131072
+var maxPathLength = 4096
+var maxMimeLength = 128
+var maxCapturedAtLength = 128
+var maxRawLength = 8388608
+
+function clamp(value, limit) {
+  var text = String(value === undefined || value === null ? "" : value)
+  return text.length > limit ? text.slice(0, limit) : text
+}
+
 function normalizeEntry(value) {
   if (typeof value === "string")
-    return value.trim().length > 0 ? { type: "text", text: value } : null
+    return value.trim().length > 0 ? { type: "text", text: clamp(value, maxEntryTextLength) } : null
 
   if (!value || typeof value !== "object") return null
 
   var type = String(value.type || value.kind || "")
   if (type === "text") {
-    var text = String(value.text || "")
+    var text = clamp(value.text, maxEntryTextLength)
     return text.trim().length > 0 ? { type: "text", text: text } : null
   }
 
   if (type === "image") {
-    var path = String(value.path || "")
+    var path = clamp(value.path, maxPathLength)
     if (!path) return null
     var entry = {
       type: "image",
       path: path,
-      mime: String(value.mime || "image/png")
+      mime: clamp(value.mime || "image/png", maxMimeLength)
     }
     if (value.capturedAt !== undefined && value.capturedAt !== null)
-      entry.capturedAt = String(value.capturedAt)
+      entry.capturedAt = clamp(value.capturedAt, maxCapturedAtLength)
     return entry
   }
 
@@ -33,12 +57,17 @@ function entryKey(entry) {
 }
 
 function parseHistory(raw) {
+  var text = String(raw || "[]")
+  // Checked before JSON.parse: a parser is the wrong place to discover that
+  // the input was too big to hold.
+  if (text.length > maxRawLength) return []
+
   try {
-    var parsed = JSON.parse(String(raw || "[]"))
+    var parsed = JSON.parse(text)
     var next = []
     if (!Array.isArray(parsed)) return next
 
-    for (var i = 0; i < parsed.length; i++) {
+    for (var i = 0; i < parsed.length && next.length < maxHistoryEntries; i++) {
       var entry = normalizeEntry(parsed[i])
       if (entry) next.push(entry)
     }
@@ -207,6 +236,13 @@ function displayRows(history, query, limit) {
 
 if (typeof module !== "undefined") {
   module.exports = {
+    limits: {
+      entries: maxHistoryEntries,
+      text: maxEntryTextLength,
+      path: maxPathLength,
+      mime: maxMimeLength,
+      raw: maxRawLength
+    },
     normalizeEntry: normalizeEntry,
     entryKey: entryKey,
     parseHistory: parseHistory,

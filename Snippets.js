@@ -13,16 +13,41 @@
 //
 // A bare top-level array is accepted too, so a hand-written file that skips
 // the wrapper object still loads.
+//
+// Bounds
+// ------
+// Everything below is clamped before it becomes a model row, because the file
+// is ordinary user-writable JSON and nothing upstream of here promises it is
+// small: it can be hand-edited, synced from another machine, or written by
+// some other tool. An unbounded array of unbounded strings turns into an
+// unbounded number of QML rows holding unbounded text, inside the shell
+// process that draws the whole desktop.
+//
+// The body limit is the one with a hard reason behind it rather than a
+// judgement: the body is handed to omarchy-clipboard-paste-text as a single
+// argument, and Linux refuses any single argument longer than 128 KiB. A body
+// over that could not be pasted at all, so it is capped at half of it — still
+// far past any snippet anyone writes by hand.
+var maxSnippets = 512
+var maxTriggerLength = 256
+var maxBodyLength = 65536
+var maxNotesLength = 4096
+var maxRawLength = 8388608
+
+function clamp(value, limit) {
+  var text = String(value === undefined || value === null ? "" : value)
+  return text.length > limit ? text.slice(0, limit) : text
+}
 
 function normalizeSnippet(value) {
   if (typeof value === "string")
-    return value.trim().length > 0 ? { trigger: "", body: value, notes: "" } : null
+    return value.trim().length > 0 ? { trigger: "", body: clamp(value, maxBodyLength), notes: "" } : null
 
   if (!value || typeof value !== "object") return null
 
-  var body = String(value.body !== undefined ? value.body : (value.text !== undefined ? value.text : ""))
-  var trigger = String(value.trigger !== undefined ? value.trigger : (value.keyword !== undefined ? value.keyword : ""))
-  var notes = String(value.notes !== undefined ? value.notes : "")
+  var body = clamp(value.body !== undefined ? value.body : (value.text !== undefined ? value.text : ""), maxBodyLength)
+  var trigger = clamp(value.trigger !== undefined ? value.trigger : (value.keyword !== undefined ? value.keyword : ""), maxTriggerLength)
+  var notes = clamp(value.notes !== undefined ? value.notes : "", maxNotesLength)
 
   // A snippet with neither a trigger nor a body is an empty row someone left
   // behind in the editor, not data worth keeping.
@@ -32,7 +57,11 @@ function normalizeSnippet(value) {
 }
 
 function parseSnippets(raw) {
-  var text = String(raw || "").trim()
+  var text = String(raw || "")
+  // Checked before the trim and before JSON.parse: a parser is the wrong place
+  // to discover that the input was too big to hold.
+  if (text.length > maxRawLength) return []
+  text = text.trim()
   if (!text) return []
 
   try {
@@ -40,7 +69,7 @@ function parseSnippets(raw) {
     var list = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.snippets) ? parsed.snippets : [])
 
     var next = []
-    for (var i = 0; i < list.length; i++) {
+    for (var i = 0; i < list.length && next.length < maxSnippets; i++) {
       var snippet = normalizeSnippet(list[i])
       if (snippet) next.push(snippet)
     }
@@ -56,7 +85,7 @@ function parseSnippets(raw) {
 function serialize(snippets) {
   var list = Array.isArray(snippets) ? snippets : []
   var clean = []
-  for (var i = 0; i < list.length; i++) {
+  for (var i = 0; i < list.length && clean.length < maxSnippets; i++) {
     var snippet = normalizeSnippet(list[i])
     if (snippet) clean.push(snippet)
   }
@@ -197,6 +226,13 @@ function removeSnippetAt(snippets, index) {
 
 if (typeof module !== "undefined") {
   module.exports = {
+    limits: {
+      snippets: maxSnippets,
+      trigger: maxTriggerLength,
+      body: maxBodyLength,
+      notes: maxNotesLength,
+      raw: maxRawLength
+    },
     normalizeSnippet: normalizeSnippet,
     parseSnippets: parseSnippets,
     serialize: serialize,
