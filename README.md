@@ -165,9 +165,17 @@ omarchy-shell shell rescanPlugins
 omarchy plugin enable io.github.prohner.snippets
 ```
 
-Saving a `.qml` file hot-reloads it. **A change to `Snippets.js` does not** —
-the QML engine caches JavaScript imports, so run `omarchy restart shell` after
-editing it.
+Saving a `.qml` file usually hot-reloads it. **A change to `Snippets.js` never
+does** — the QML engine caches JavaScript imports. And when the plugin is
+symlinked in from outside `~/.config/omarchy`, as above, the shell may not notice
+a save at all and will happily keep running the code it loaded at startup. Check
+what is actually running before concluding a change did nothing:
+
+```bash
+pgrep -a -f omarchy-snippets-helper
+```
+
+If in doubt, `omarchy restart shell`.
 
 ```bash
 node test/snippets.test.js   # search ranking, parsing, and the schema bounds
@@ -181,6 +189,82 @@ atomic writes that a planted symlink cannot redirect, producer-side caps, and
 killing a watcher by recorded identity rather than by resemblance — is exactly
 the part that cannot be reached from QML. Neither suite touches your real
 snippet library, your real clipboard history, or your clipboard.
+
+### Trying a change without restarting your shell
+
+`omarchy restart shell` takes your actual desktop down with it, and a plugin that
+fails to load leaves you with no shell to fix it from. Load the plugin in a
+second Quickshell instance instead. An overlay is only `visible` once it is
+opened, so nothing appears on screen — but the helper, the watchers, the file
+writes, and the parsing all run for real.
+
+```bash
+root=$(mktemp -d) && home=$(mktemp -d) && rt=$(mktemp -d)
+for d in Commons Ui services; do ln -s "/usr/share/omarchy/shell/$d" "$root/$d"; done
+ln -s "$PWD" "$root/plugin"
+ln -s "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" "$rt/$WAYLAND_DISPLAY"
+
+cat > "$root/shell.qml" <<'QML'
+import Quickshell
+import QtQuick
+import "plugin" as Snippets
+
+ShellRoot {
+  Snippets.Clipboard { id: plugin }
+  Timer {
+    interval: 5000; running: true; repeat: false
+    onTriggered: {
+      console.log("snippets=" + plugin.snippets.length
+        + " history=" + plugin.history.length
+        + " status=[" + plugin.statusHint + "]")
+      Qt.quit()
+    }
+  }
+}
+QML
+
+HOME=$home XDG_RUNTIME_DIR=$rt QT_QPA_PLATFORM=wayland quickshell -n -p "$root"
+```
+
+Both fake directories earn their place. The fake `HOME` keeps this off your real
+snippet library and clipboard history, because the helper resolves both paths
+from it. The fake `XDG_RUNTIME_DIR` keeps it off the watcher identity record,
+which the helper also keeps there — your running shell has one, `reap` truncates
+it at startup, and an instance sharing the directory would blank the record your
+real shell depends on. Symlinking the compositor socket across is what lets the
+instance still reach Wayland from an otherwise empty runtime directory.
+
+(`reap` would not have *killed* your shell's watchers even sharing the directory:
+they are recorded against a different helper path, and identity has to match on
+the command line too. Blanking the record is the lesser failure, and the isolated
+runtime directory avoids it entirely.)
+
+Seed `$home/.config/omarchy/snippets.json` to test loading, write to it while the
+instance runs to test live reload, and call `plugin.saveSnippets([…])` from the
+timer to test the write path. Then check that nothing outlived it:
+
+```bash
+ps -eo pid,args | grep "$root"
+```
+
+Grep for `$root` specifically, not for the process names: your own shell is
+running this same plugin under `~/.config/omarchy/plugins`, and its watchers are
+supposed to be there. Only the ones naming the temporary directory came from the
+instance you just ran, and once it has quit there should be none. A watcher left
+behind is a bug — see [SECURITY.md](SECURITY.md) for the three mechanisms that
+are supposed to prevent it.
+
+`qmllint` is worth running first, and needs an import path that makes `qs.*`
+resolve:
+
+```bash
+imports=$(mktemp -d) && ln -s /usr/share/omarchy/shell "$imports/qs"
+/usr/lib/qt6/bin/qmllint -I "$imports" -I . *.qml
+```
+
+Ignore its `Style.*` and `Color.*` "member not found on QObject" warnings — it
+cannot see Omarchy's singleton types, and the built-in clipboard plugin produces
+the same ones.
 
 ### Staying current with upstream
 
