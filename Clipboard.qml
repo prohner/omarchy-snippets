@@ -37,6 +37,14 @@ Item {
   // a broken install looks exactly like an empty clipboard.
   property bool helperFailing: false
 
+  // +snippets: the exact bytes this plugin last asked the helper to write.
+  // The watcher cannot tell our own write from someone else's, and reports it
+  // back about a second later; reloading on it replaced the snippet array the
+  // editor is showing, which sent the editor back to the stored text and threw
+  // away whatever had been typed since. Nothing has changed when the file comes
+  // back as what we put in it, so nothing needs reloading.
+  property string lastSnippetsWritten: ""
+
   // +hardened: this plugin runs exactly one executable, and finds it from this
   // file's own location rather than from $PATH or $OMARCHY_PATH. Every
   // external program it runs, every byte it reads from disk, and every byte it
@@ -205,6 +213,9 @@ Item {
 
   // +snippets: snippet library load / save / edit ------------------------
   function loadSnippets(raw) {
+    // Our own write, arriving back from the watcher. See lastSnippetsWritten.
+    if (root.lastSnippetsWritten.length > 0 && String(raw) === root.lastSnippetsWritten) return
+
     root.snippets = Snippets.parseSnippets(raw)
     var text = String(raw || "").trim()
     root.snippetsBroken = text.length > 0 && root.snippets.length === 0
@@ -212,10 +223,15 @@ Item {
   }
 
   function saveSnippets(list) {
-    root.snippets = Array.isArray(list) ? list : []
+    var text = Snippets.serialize(Array.isArray(list) ? list : [])
+    // Hold what the file holds, rather than what the caller passed: serialize
+    // drops empty rows and clamps oversized fields, and memory that disagrees
+    // with the file would make the write coming back look like a real change.
+    root.snippets = Snippets.parseSnippets(text)
+    root.lastSnippetsWritten = text
     root.snippetsBroken = false
     root.snippetsUnreadable = false
-    snippetsWriter.submit(Snippets.serialize(root.snippets))
+    snippetsWriter.submit(text)
     if (root.opened) root.rebuildDisplay()
   }
 

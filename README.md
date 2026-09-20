@@ -180,6 +180,7 @@ If in doubt, `omarchy restart shell`.
 ```bash
 node test/snippets.test.js   # search ranking, parsing, and the schema bounds
 test/helper.test.sh          # the helper, against a sandbox HOME
+test/editor.test.sh          # the editor, in an offscreen quickshell
 ```
 
 `Snippets.js` imports nothing from QML, so the search ranking, the file parsing,
@@ -187,8 +188,19 @@ and the size bounds are tested in plain node with no dependencies. The helper is
 tested in bash, because what is worth testing about it — descriptor-safe reads,
 atomic writes that a planted symlink cannot redirect, producer-side caps, and
 killing a watcher by recorded identity rather than by resemblance — is exactly
-the part that cannot be reached from QML. Neither suite touches your real
-snippet library, your real clipboard history, or your clipboard.
+the part that cannot be reached from QML.
+
+The editor needs a QML engine, so it gets an offscreen `quickshell` with the
+Omarchy shell's modules symlinked in beside the plugin and a stand-in for
+`Clipboard.qml`. What that suite is really for is the round trip through the
+file: the editor never owns its list, it is handed one and hands back a
+replacement, and then the file watcher reports that write back about a second
+later. Every editor bug worth having a test for has come from that echo landing
+while the form was open — see the file's header. It skips itself where
+quickshell is not installed.
+
+None of the three touches your real snippet library, your real clipboard
+history, or your clipboard.
 
 ### Trying a change without restarting your shell
 

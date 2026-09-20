@@ -48,10 +48,49 @@ Item {
   // source of the change, so committing does not clobber the caret.
   property bool _selfEditing: false
 
-  readonly property var current: (selectedIndex >= 0 && selectedIndex < (snippets ? snippets.length : 0)) ? snippets[selectedIndex] : null
+  // A snippet being created lives here, not in the file, until it holds
+  // something the file would keep. A row with no trigger and no body is
+  // dropped on serialize, so writing a blank one and reading it back deletes
+  // it — and used to take the open form down with it a second later, when the
+  // watcher reported our own write.
+  property var _draft: null
+
+  // What the editor shows: the saved snippets, plus the unsaved draft on the
+  // end. Only `snippets` is ever written.
+  //
+  // These are functions, and the properties below are bindings onto them,
+  // because a handler for snippetsChanged can run before a binding that
+  // derives from `snippets` has been re-evaluated. Imperative code reading
+  // such a binding gets the previous value — which here meant loading the
+  // fields from a stale list, blanking them, and then committing the blanks
+  // over a real snippet. Called as functions they are always current, and the
+  // bindings still track their dependencies, since QML captures whatever a
+  // binding reads while it runs, including inside a function it calls.
+  function persistedCount() {
+    return Array.isArray(root.snippets) ? root.snippets.length : 0
+  }
+
+  function rowList() {
+    var list = Array.isArray(root.snippets) ? root.snippets : []
+    return root._draft ? list.concat([root._draft]) : list
+  }
+
+  function rowAt(index) {
+    var list = root.rowList()
+    return (index >= 0 && index < list.length) ? list[index] : null
+  }
+
+  function draftIsSelected() {
+    return root._draft !== null && root.selectedIndex === root.persistedCount()
+  }
+
+  readonly property var rows: root.rowList()
+  readonly property int draftIndex: root._draft ? root.persistedCount() : -1
+  readonly property bool draftSelected: root.draftIsSelected()
+  readonly property var current: root.rowAt(root.selectedIndex)
 
   function loadFields() {
-    var snippet = root.current
+    var snippet = root.rowAt(root.selectedIndex)
     triggerField.text = snippet ? String(snippet.trigger || "") : ""
     bodyField.text = snippet ? String(snippet.body || "") : ""
     notesField.text = snippet ? String(snippet.notes || "") : ""
@@ -61,14 +100,31 @@ Item {
   // Returns the list the caller should keep working against.
   function commit() {
     var list = Array.isArray(root.snippets) ? root.snippets.slice() : []
-    var i = root.selectedIndex
-    if (i < 0 || i >= list.length) return list
-
     var updated = {
       trigger: triggerField.text,
       body: bodyField.text,
       notes: notesField.text
     }
+
+    if (root.draftIsSelected()) {
+      // Still nothing the file would keep, so it stays a draft. Notes alone
+      // does not count: serialize drops a row with no trigger and no body
+      // whatever is in its notes.
+      if (updated.trigger.trim().length === 0 && updated.body.length === 0) {
+        root._draft = updated
+        return list
+      }
+      list.push(updated)
+      root._draft = null
+      root._selfEditing = true
+      root.changed(list)
+      root._selfEditing = false
+      return list
+    }
+
+    var i = root.selectedIndex
+    if (i < 0 || i >= list.length) return list
+
     var currentSnippet = list[i]
     if (String(currentSnippet.trigger || "") === updated.trigger
         && String(currentSnippet.body || "") === updated.body
@@ -84,24 +140,35 @@ Item {
 
   function selectSnippet(index) {
     if (index === root.selectedIndex) return
+    var leavingDraft = root.draftIsSelected()
     root.commit()
-    root.selectedIndex = Math.max(0, Math.min(index, (root.snippets ? root.snippets.length : 1) - 1))
+    // An untouched draft is abandoned by clicking away from it; a filled one
+    // was just promoted into the list by commit() and is no longer a draft.
+    if (leavingDraft && root._draft) root._draft = null
+    root.selectedIndex = Math.max(0, Math.min(index, root.rowList().length - 1))
     root.loadFields()
   }
 
   function addSnippet() {
-    var list = root.commit()
-    list = Snippets.addSnippet(list, Snippets.emptySnippet())
-    root._selfEditing = true
-    root.changed(list)
-    root._selfEditing = false
-    root.selectedIndex = list.length - 1
+    root.commit()
+    // Ctrl+N on an already-blank draft keeps the one that is open rather than
+    // stacking another blank row behind it.
+    if (!root._draft) root._draft = Snippets.emptySnippet()
+    root.selectedIndex = root.rowList().length - 1
     root.loadFields()
     Qt.callLater(function() { triggerField.forceActiveFocus() })
   }
 
   function requestDelete() {
-    if (!root.current) return
+    if (!root.rowAt(root.selectedIndex)) return
+    // An unsaved draft has nothing to confirm and nothing to lose.
+    if (root.draftIsSelected()) {
+      root._draft = null
+      root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, root.rowList().length - 1))
+      root.loadFields()
+      Qt.callLater(function() { editorKeys.forceActiveFocus() })
+      return
+    }
     deleteConfirm.selectedIndex = 1
     root.deleteConfirmOpen = true
   }
@@ -112,7 +179,7 @@ Item {
     root.changed(list)
     root._selfEditing = false
     root.deleteConfirmOpen = false
-    root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, list.length - 1))
+    root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, root.rowList().length - 1))
     root.loadFields()
     Qt.callLater(function() { editorKeys.forceActiveFocus() })
   }
@@ -127,13 +194,24 @@ Item {
     root.closed()
   }
 
-  onSnippetsChanged: if (!root._selfEditing) root.loadFields()
+  // An external edit can shorten the library under a selection, so the index
+  // is clamped before the fields are read through it.
+  onSnippetsChanged: {
+    if (root._selfEditing) return
+    root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, root.rowList().length - 1))
+    root.loadFields()
+  }
 
   // Reload fields whenever the editor is shown, so reopening after an external
   // edit to snippets.json does not display stale text.
   onVisibleChanged: {
-    if (!visible) return
-    root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, (root.snippets ? root.snippets.length : 1) - 1))
+    if (!visible) {
+      // Nothing carries an abandoned blank row over to the next time the
+      // editor is opened.
+      root._draft = null
+      return
+    }
+    root.selectedIndex = Math.max(0, Math.min(root.selectedIndex, root.rowList().length - 1))
     root.loadFields()
     Qt.callLater(function() { editorKeys.forceActiveFocus() })
   }
@@ -216,7 +294,7 @@ Item {
                 id: snippetList
                 width: parent.width
                 height: parent.height - newRow.height - Style.space(8)
-                model: root.snippets
+                model: root.rows
                 clip: true
                 spacing: Style.space(2)
                 boundsBehavior: Flickable.StopAtBounds
@@ -302,6 +380,7 @@ Item {
               visible: root.current !== null
 
               Text {
+                id: triggerCaption
                 textFormat: Text.PlainText
                 text: "Trigger"
                 color: root.foreground
@@ -323,6 +402,7 @@ Item {
               Item { width: 1; height: Style.space(4) }
 
               Text {
+                id: bodyCaption
                 textFormat: Text.PlainText
                 text: "Body"
                 color: root.foreground
@@ -335,9 +415,17 @@ Item {
                 id: bodyField
                 width: parent.width
                 // Body takes the slack; notes keeps a fixed, smaller box.
-                height: parent.height - triggerField.height - notesField.height
-                        - Style.space(4) * 2 - Style.space(6) * 6
-                        - Style.font.caption * 3
+                //
+                // Measured from what the siblings actually are, because
+                // guessing overran the column: this counted six Column gaps
+                // where eight children make seven, and took a caption to be
+                // Style.font.caption tall when a Text is a line height tall.
+                // The notes box then hung past the bottom and swallowed the
+                // margin the footer sits in, leaving Done against its edge.
+                height: parent.height - triggerCaption.implicitHeight - triggerField.height
+                        - bodyCaption.implicitHeight - notesCaption.implicitHeight
+                        - notesField.height
+                        - Style.space(4) * 2 - Style.space(6) * 7
                 placeholderText: "Thanks, Preston"
                 foreground: root.foreground
                 accent: root.selectedText
@@ -348,6 +436,7 @@ Item {
               Item { width: 1; height: Style.space(4) }
 
               Text {
+                id: notesCaption
                 textFormat: Text.PlainText
                 text: "Notes"
                 color: root.foreground
