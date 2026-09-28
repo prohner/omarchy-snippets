@@ -11,6 +11,9 @@ No accounts. No cloud. Just a JSON file on disk.
 The picker opens on your clipboard history as always. Type, and matching
 snippets jump to the top — Enter pastes.
 
+Type a sum instead — `1,299.99 * 3 - 15%` — and the answer is the top row,
+Alfred-style. Enter pastes it.
+
 Omarchy's clipboard history is capped at 300 entries, so canned text seeded
 into it gets pushed off the end by an afternoon of copying. Snippets live in
 their own file and are merged into the picker at display time, so they are
@@ -49,6 +52,46 @@ trigger substring, body, notes — ties keep the order you wrote them in.
 
 ![Editor](docs/editor.png)
 
+## Calculator
+
+Type arithmetic into the search box and the answer appears as the top row, the
+way it does in [Alfred](https://www.alfredapp.com/help/features/calculator/).
+
+![Calculator](docs/calculator.png)
+
+- **Enter** pastes the answer, **Shift+Enter** copies it
+- **`=`** at the end swaps the expression for its answer, so you can keep going:
+  `2+2` `=` gives `4`, then type `*3`
+- **`+ - * / ^`** and parentheses, with the usual precedence. `**`, `×`, `÷` work
+  too
+- **Percentages** — `100 + 10%` is 110, `100 - 15%` is 85, `200 * 15%` is 30.
+  (Alfred's own calculator does not do this. Its users keep asking for it.)
+- **Currency symbols are skipped**, and thousands separators are understood, so
+  `$1,299.99` pasted from a web page works as it is
+- **Your locale** decides the decimal mark. With a decimal comma, `1.234,5` is a
+  number, and answers are written with a comma too
+
+It stays out of the way of search. A bare number such as `42` or `2026` is still
+a search, since a calculation needs an operator between two numbers. Anything
+that is not complete arithmetic, like `git push` or `2 +`, gets no answer. A
+snippet whose trigger is exactly what you typed still comes first.
+
+### Advanced: start with `=`
+
+As in Alfred, a leading `=` turns on functions and constants, and makes `%`
+mean modulo:
+
+```
+=sqrt(2)        =sin(dtor(30))      =17 % 5        =pi * 2
+```
+
+`sin cos tan asin acos atan sinh cosh tanh asinh acosh atanh` (radians — `dtor`
+and `rtod` convert), `log` (base 10) `log2 ln exp`, `abs sqrt cbrt`,
+`ceil floor round trunc rint`, and the constants `pi` (or `π`) and `e`.
+
+Answers carry 15 significant digits, so `0.1 + 0.2` is `0.3`. Division by zero
+and the like produce no answer rather than `Infinity`.
+
 ## Keyboard
 
 In the picker:
@@ -57,6 +100,7 @@ In the picker:
 - **Enter** pastes the highlighted entry
 - **Shift+Enter** copies it without pasting
 - **Alt+Enter** edits a snippet, or opens a history entry externally
+- **=** after a calculation replaces it with its answer
 - **Ctrl+E** opens the snippet editor
 - **Delete** removes a clipboard entry (snippets are deleted from the editor)
 - **Escape** clears the search, then closes
@@ -179,8 +223,10 @@ If in doubt, `omarchy restart shell`.
 
 ```bash
 node test/snippets.test.js   # search ranking, parsing, and the schema bounds
+node test/calculator.test.js # the calculator: answers, grammar, locale, bounds
 test/helper.test.sh          # the helper, against a sandbox HOME
 test/editor.test.sh          # the editor, in an offscreen quickshell
+test/picker.test.sh          # the calculator inside the real picker
 ```
 
 `Snippets.js` imports nothing from QML, so the search ranking, the file parsing,
@@ -199,7 +245,14 @@ later. Every editor bug worth having a test for has come from that echo landing
 while the form was open — see the file's header. It skips itself where
 quickshell is not installed.
 
-None of the three touches your real snippet library, your real clipboard
+The picker test loads the real `Clipboard.qml` in a second, isolated quickshell
+instance. That needs a Wayland session, because the picker is a layer-shell
+window, but nothing appears on screen: the overlay is never opened. It uses a
+copy of the plugin whose helper is a stub, which serves a fixed snippet library
+and logs each paste and copy it is asked for. Answers are checked there, in the
+C locale and again in German, where the decimal mark is a comma.
+
+None of the four touches your real snippet library, your real clipboard
 history, or your clipboard.
 
 ### Trying a change without restarting your shell
@@ -282,11 +335,13 @@ the same ones.
 
 `Clipboard.qml` is a fork of Omarchy's built-in clipboard overlay, tracking
 **Omarchy 4.0.2-1**. Feature additions live in files upstream does not have
-(`Snippets.js`, `SnippetsEditor.qml`, `SnippetTextArea.qml`, `GuardedWriter.qml`,
-`bin/omarchy-snippets-helper`), and every deviation inside `Clipboard.qml`
-itself carries one of two markers:
+(`Snippets.js`, `Calculator.js`, `SnippetsEditor.qml`, `SnippetTextArea.qml`,
+`GuardedWriter.qml`, `bin/omarchy-snippets-helper`), and every deviation inside
+`Clipboard.qml` itself carries one of three markers:
 
 - `+snippets` — the snippet feature. Small, and easy to re-apply.
+- `+calculator` — the calculator: one extra row, the `=` key, and its preview.
+  Small, and easy to re-apply.
 - `+hardened` — how the overlay reaches processes and files at all. These
   replace upstream machinery rather than adding to it, and re-applying them is a
   judgement call, not a copy. [SECURITY.md](SECURITY.md) says what each one
@@ -296,7 +351,7 @@ itself carries one of two markers:
 diff -u /usr/share/omarchy/shell/plugins/clipboard/Clipboard.qml Clipboard.qml
 ```
 
-Every hunk should carry one of those two markers. To pick up a new release,
+Every hunk should carry one of those markers. To pick up a new release,
 re-copy the upstream file, re-apply the hunks, and bump the version above.
 
 `ClipboardHistory.js` **used to be** a verbatim copy of upstream's and no longer

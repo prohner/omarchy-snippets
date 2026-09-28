@@ -160,7 +160,10 @@ function displayRows(snippets, query, limit) {
         mime: "text/plain",
         index: -1,
         snippetIndex: i,
-        notes: String(snippet.notes || "")
+        notes: String(snippet.notes || ""),
+        // Read by Calculator.withResult, so a snippet literally named what
+        // was typed keeps first place over an answer to it.
+        exactTrigger: score === 100
       }
     })
   }

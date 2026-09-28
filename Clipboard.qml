@@ -6,13 +6,14 @@ import qs.Commons
 import qs.Ui
 import "ClipboardHistory.js" as ClipboardHistory
 import "Snippets.js" as Snippets // +snippets
+import "Calculator.js" as Calculator // +calculator
 
 // FORK of the built-in omarchy.clipboard overlay (Omarchy 4.0.2-1).
 //
-// Every deviation from upstream is marked `+snippets` so this file can be
-// re-synced by diffing against the stock plugin and re-applying the marked
-// hunks. Keep it that way: new behavior belongs in Snippets.js or
-// SnippetsEditor.qml, not here. See README.md.
+// Every deviation from upstream is marked `+snippets`, `+calculator`, or
+// `+hardened` so this file can be re-synced by diffing against the stock plugin
+// and re-applying the marked hunks. Keep it that way: new behavior belongs in
+// Snippets.js, Calculator.js, or SnippetsEditor.qml, not here. See README.md.
 Item {
   id: root
 
@@ -71,6 +72,13 @@ Item {
   // +hardened: the header line. A plugin that has quietly stopped working looks
   // exactly like a plugin with nothing to show, so each way it can stop working
   // gets said out loud, most fundamental first.
+  // +calculator: numbers in the search box are read, and answers written, in
+  // the user's locale — a decimal comma where that is the convention.
+  readonly property var calcOptions: ({
+    decimalMark: Qt.locale().decimalPoint,
+    groupMark: Qt.locale().groupSeparator
+  })
+
   readonly property string statusHint: root.helperFailing ? "snippets helper is not running"
     : root.snippetsUnreadable ? "snippets.json could not be read"
     : root.snippetsBroken ? "snippets.json has a syntax error"
@@ -251,6 +259,22 @@ Item {
     return displayModel.count
   }
 
+  // +calculator: the row at a display index, or null. Also what the picker
+  // test reads the model through.
+  function rowAt(index) {
+    return index >= 0 && index < displayModel.count ? displayModel.get(index) : null
+  }
+
+  // +calculator: `=` typed after a calculation swaps the expression for its
+  // answer, as in Alfred, so the next operator carries on from it. Returns
+  // false when the box holds no calculation and `=` should just be typed.
+  function continueCalculation() {
+    var next = Calculator.continued(root.filterText, root.calcOptions)
+    if (next === null) return false
+    root.setFilter(next)
+    return true
+  }
+
   // Hands the raw file to the user's editor in a terminal. The helper watches
   // the path, so saving in $EDITOR refreshes the picker with no further action.
   //
@@ -295,6 +319,7 @@ Item {
     // destructive edit to authored config, so it stays in the editor behind a
     // confirmation rather than being one keystroke away in the picker.
     if (row.entryType === "snippet") return
+    if (row.entryType === "calc") return // +calculator: nothing stored to delete
     root.history = ClipboardHistory.removeEntryAt(root.history, row.historyIndex)
     root.saveHistory()
 
@@ -317,6 +342,8 @@ Item {
       Snippets.displayRows(root.snippets, root.filterText, 50),
       ClipboardHistory.displayRows(root.history, root.filterText, 50),
       root.filterText)
+    // +calculator: when the box holds a calculation, its answer leads.
+    rows = Calculator.withResult(rows, root.filterText, root.calcOptions)
 
     displayModel.clear()
     for (var i = 0; i < rows.length; i++) {
@@ -332,7 +359,10 @@ Item {
         // +snippets: every row carries both fields so the ListModel roles stay
         // uniform. -1 marks a row that came from clipboard history.
         snippetIndex: row.snippetIndex === undefined ? -1 : row.snippetIndex,
-        notes: row.notes === undefined ? "" : row.notes
+        notes: row.notes === undefined ? "" : row.notes,
+        // +calculator: likewise, "" on every row that is not an answer.
+        expression: row.expression === undefined ? "" : row.expression,
+        display: row.display === undefined ? "" : row.display
       })
     }
 
@@ -408,7 +438,7 @@ Item {
     // literally. --shift-insert still copies first and pastes via the
     // clipboard rather than synthesizing keystrokes, which is both faster and
     // lossless for long or multi-line bodies.
-    if (row.entryType === "snippet") {
+    if (row.entryType === "snippet" || row.entryType === "calc") { // +calculator: an answer too
       if (row.fullText) root.runDetached(["run", "paste-text", "--shift-insert", row.fullText])
     } else if (row.entryType === "image") {
       root.runDetached(["run", "paste-file", row.mime, row.path])
@@ -420,7 +450,7 @@ Item {
   function copySelected(row) {
     if (!row) return
     root.opened = false
-    if (row.entryType === "snippet") { // +snippets
+    if (row.entryType === "snippet" || row.entryType === "calc") { // +snippets +calculator
       if (row.fullText) root.runDetached(["run", "paste-text", "--copy-only", row.fullText])
     } else if (row.entryType === "image") {
       root.runDetached(["run", "paste-file", "--copy-only", row.mime, row.path])
@@ -431,6 +461,7 @@ Item {
 
   function openSelected(row) {
     if (!row) return
+    if (row.entryType === "calc") return // +calculator: nothing to open
     // +snippets: Alt+Enter on a snippet edits it instead of opening a history
     // entry in an external viewer.
     if (row.entryType === "snippet") {
@@ -692,6 +723,7 @@ Item {
             else if (displayModel.count > 0) root.cursorActive = true
             event.accepted = true
           } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
+            if (event.text === "=" && root.continueCalculation()) { event.accepted = true; return } // +calculator
             root.setFilter(root.filterText + event.text)
             event.accepted = true
           }
@@ -765,8 +797,8 @@ Item {
             anchors.right: hint.left // +snippets: leave room for the hint
             anchors.rightMargin: Style.space(10)
             anchors.verticalCenter: parent.verticalCenter
-            // +snippets: snippets are searched alongside history, so say so.
-            text: root.filterText || "Search clipboard and snippets…"
+            // +snippets +calculator: say what the box does besides history.
+            text: root.filterText || "Search clipboard and snippets, or calculate…"
             color: root.foreground
             opacity: root.filterText ? 1 : 0.58
             font.family: root.fontFamily
@@ -835,13 +867,14 @@ Item {
                     spacing: Style.space(10)
 
                     // +snippets: marks a pinned snippet apart from the
-                    // clipboard entries it sits above.
+                    // clipboard entries it sits above. +calculator: and an
+                    // answer apart from both.
                     Text {
                       id: snippetMark
-                      visible: row.entryType === "snippet"
+                      visible: row.entryType === "snippet" || row.entryType === "calc"
                       width: visible ? implicitWidth : 0
                       height: parent.height
-                      text: "󰅇"
+                      text: row.entryType === "calc" ? "󰃬" : "󰅇"
                       color: row.hasCursor ? root.selectedText : root.foreground
                       opacity: row.hasCursor ? 1.0 : 0.55
                       font.family: root.fontFamily
@@ -942,9 +975,54 @@ Item {
                 }
               }
 
+              // +calculator: an answer is previewed as the sum it came from,
+              // the answer grouped for reading, and what the keys do with it.
+              readonly property bool activeCalc: activeRow !== null && activeRow.entryType === "calc"
+
+              Column {
+                visible: parent.activeCalc
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.leftMargin: root.contentMargin
+                spacing: Style.space(10)
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: parent.parent.activeCalc ? parent.parent.activeRow.expression : ""
+                  color: root.foreground
+                  opacity: 0.65
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.title
+                  wrapMode: Text.WrapAnywhere
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: parent.parent.activeCalc ? "= " + parent.parent.activeRow.display : ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.heading
+                  wrapMode: Text.WrapAnywhere
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: "Enter pastes · Shift+Enter copies · = keeps calculating"
+                  color: root.foreground
+                  opacity: 0.45
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
+
               Text {
                 textFormat: Text.PlainText
-                visible: parent.activeRow && !parent.activeRow.previewImage
+                visible: parent.activeRow && !parent.activeRow.previewImage && !parent.activeCalc // +calculator
                 anchors.fill: parent
                 anchors.leftMargin: root.contentMargin
                 anchors.rightMargin: 0

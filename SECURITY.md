@@ -165,6 +165,20 @@ argument, and Linux refuses any single argument longer than 128 KiB. A body
 above that could not be pasted at all, so capping it well under is the
 difference between a clear limit and an opaque `E2BIG`.
 
+### The calculator's input
+
+The calculator (`Calculator.js`) evaluates whatever is in the search box, on
+every keystroke, inside the shell process — and that text can be pasted from
+anywhere. So it is a hand-written parser over a fixed grammar, never `eval()`
+or `Function()`: numbers, `+ - * / ^ %`, parentheses, and a fixed table of
+`Math` functions and constants, looked up with `hasOwnProperty` so that
+`constructor`, `__proto__`, and friends are unknown names rather than property
+lookups. Input over 256 characters is not evaluated, and nesting past 32
+levels (parentheses or unary signs) is refused, so no query can make the
+recursion deep or the work large. An answer is pasted exactly as a snippet body
+is, through `omarchy-clipboard-paste-text`, and is only ever a number.
+`test/calculator.test.js` covers the grammar's edges and both limits.
+
 ## 6. Recorded process identity instead of pattern killing
 
 **Before:** startup ran
@@ -230,6 +244,7 @@ Three independent things have to fail before a watcher is left running:
 
 ```bash
 node test/snippets.test.js   # search ranking, parsing, and the schema bounds
+node test/calculator.test.js # the calculator's grammar and input bounds
 test/helper.test.sh          # the helper, against a sandbox HOME
 ```
 
