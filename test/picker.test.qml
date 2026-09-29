@@ -59,6 +59,7 @@ ShellRoot {
         plugin.setFilter("2+2")
         root.ok(root.row(0) === "calc:4", "an answer is the first row (" + root.row(0) + ")")
         root.ok(plugin.rowAt(0).expression === "2+2", "and carries its expression")
+        root.ok(plugin.rowAt(0).help.indexOf("Start with =") >= 0, "and a pointer to the = functions")
         plugin.setFilter("1234567*2")
         var group = plugin.calcOptions.groupMark
         root.ok(root.row(0) === "calc:2469134", "the answer pasted is ungrouped")
@@ -88,6 +89,7 @@ ShellRoot {
         root.ok(root.row(0) === "calc:12", "and the next operator carries on from it")
         plugin.setFilter("=sqrt(16)")
         root.ok(root.row(0) === "calc:4", "advanced mode answers")
+        root.ok(plugin.rowAt(0).help.indexOf("atanh") >= 0, "and carries the full function reference")
         root.ok(plugin.continueCalculation() && plugin.filterText === "=4", "= keeps the advanced prefix")
         break
 

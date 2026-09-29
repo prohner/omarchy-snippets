@@ -63,6 +63,18 @@ var functions = {
 
 var constants = { pi: Math.PI, "π": Math.PI, e: Math.E }
 
+// The advanced-mode reference shown in the preview pane, grouped so it can be
+// scanned. test/calculator.test.js checks that every function above appears
+// here exactly once, and nothing else does, so the two cannot drift.
+var reference = [
+  { label: "Trig (radians)", names: ["sin", "cos", "tan", "asin", "acos", "atan"] },
+  { label: "Hyperbolic", names: ["sinh", "cosh", "tanh", "asinh", "acosh", "atanh"] },
+  { label: "Angles", names: ["dtor", "rtod"] },
+  { label: "Logs", names: ["log", "log2", "ln", "exp"], note: "log is base 10" },
+  { label: "Rounding", names: ["ceil", "floor", "round", "trunc", "rint"] },
+  { label: "Other", names: ["abs", "sqrt", "cbrt"] }
+]
+
 function roundHalfEven(x) {
   var r = Math.round(x)
   // Math.round sends every .5 up; rint sends it to the even neighbour.
@@ -341,6 +353,24 @@ function continued(query, options) {
   return (result.mode === "advanced" ? "=" : "") + result.text
 }
 
+// The help under an answer in the preview pane. Standard mode gets one hint
+// that the functions exist; advanced mode, where they are in use, gets the
+// whole list.
+function helpText(mode) {
+  if (mode !== "advanced") {
+    return "+ − × ÷ ^ ( )  ·  100 + 10% is 110  ·  $ and , are ignored\n"
+      + "Start with = for functions: =sqrt(2), =sin(dtor(30)), =pi"
+  }
+  var lines = []
+  for (var i = 0; i < reference.length; i++) {
+    var group = reference[i]
+    lines.push(group.label + ":  " + group.names.join(" ") + (group.note ? "  (" + group.note + ")" : ""))
+  }
+  lines.push("Constants:  pi π e  ·  % is modulo")
+  lines.push("Functions take parentheses: sqrt(16)")
+  return lines.join("\n")
+}
+
 // A picker row, shaped like the rows Snippets.js and ClipboardHistory.js build
 // so that one delegate draws all three.
 function displayRow(result) {
@@ -355,7 +385,8 @@ function displayRow(result) {
     snippetIndex: -1,
     notes: "",
     expression: result.expression,
-    display: result.display
+    display: result.display,
+    help: helpText(result.mode)
   }
 }
 
@@ -380,6 +411,8 @@ if (typeof module !== "undefined") {
     formatNumber: formatNumber,
     formatGrouped: formatGrouped,
     displayRow: displayRow,
+    helpText: helpText,
+    reference: reference,
     withResult: withResult,
     functionNames: Object.keys(functions)
   }

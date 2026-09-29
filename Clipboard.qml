@@ -362,7 +362,8 @@ Item {
         notes: row.notes === undefined ? "" : row.notes,
         // +calculator: likewise, "" on every row that is not an answer.
         expression: row.expression === undefined ? "" : row.expression,
-        display: row.display === undefined ? "" : row.display
+        display: row.display === undefined ? "" : row.display,
+        help: row.help === undefined ? "" : row.help
       })
     }
 
@@ -1016,6 +1017,26 @@ Item {
                   opacity: 0.45
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+
+                // What else the calculator understands: a pointer to the `=`
+                // functions under a plain sum, the full list under one of them.
+                Rectangle {
+                  width: parent.width
+                  height: Style.normalBorderWidth
+                  color: Util.alpha(root.border, 0.28)
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  text: parent.parent.activeCalc ? parent.parent.activeRow.help : ""
+                  color: root.foreground
+                  opacity: 0.65
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  lineHeight: 1.3
                   wrapMode: Text.WordWrap
                 }
               }

@@ -120,6 +120,23 @@ var alfred = ["sin", "cos", "tan", "log", "log2", "ln", "exp", "abs", "sqrt", "a
   "sinh", "cosh", "tanh", "asinh", "acosh", "atanh", "ceil", "floor", "round", "trunc", "rint", "dtor", "rtod"]
 eq(alfred.filter(function(f) { return C.functionNames.indexOf(f) < 0 }), [], "every Alfred function is present")
 
+// --- help -------------------------------------------------------------------
+var listed = []
+C.reference.forEach(function(g) { listed = listed.concat(g.names) })
+eq(listed.slice().sort(), C.functionNames.slice().sort(), "the reference lists every function exactly once, and only those")
+eq(listed.length, C.functionNames.length, "and lists none twice")
+var advancedHelp = C.helpText("advanced")
+eq(C.functionNames.filter(function(f) { return advancedHelp.indexOf(f) < 0 }), [], "advanced help names every function")
+eq(/pi π e/.test(advancedHelp) && /modulo/.test(advancedHelp), true, "advanced help gives constants and modulo")
+var standardHelp = C.helpText("standard")
+eq(/Start with =/.test(standardHelp), true, "standard help points at the = prefix")
+eq(/sqrt/.test(standardHelp) && !/atanh/.test(standardHelp), true, "standard help hints, it does not list everything")
+eq(C.evaluate("2+2") && C.displayRow(C.evaluate("2+2")).help, standardHelp, "a standard answer carries the standard help")
+eq(C.displayRow(C.evaluate("=2")).help, advancedHelp, "an advanced answer carries the full reference")
+// Every example the help shows has to actually work.
+eq(text("=sqrt(2)") !== null && text("=sin(dtor(30))") === "0.5" && text("=pi") !== null && text("100 + 10%") === "110",
+   true, "the examples in the help work")
+
 // --- locale -----------------------------------------------------------------
 var de = { decimalMark: ",", groupMark: "." }
 eq(text("1.234,5 + 0,5", de), "1235", "decimal comma, point grouping")

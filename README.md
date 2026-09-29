@@ -89,6 +89,9 @@ mean modulo:
 and `rtod` convert), `log` (base 10) `log2 ln exp`, `abs sqrt cbrt`,
 `ceil floor round trunc rint`, and the constants `pi` (or `π`) and `e`.
 
+The preview pane lists all of this under an answer: a pointer to the `=`
+functions beneath a plain sum, and the full list beneath an advanced one.
+
 Answers carry 15 significant digits, so `0.1 + 0.2` is `0.3`. Division by zero
 and the like produce no answer rather than `Infinity`.
 
