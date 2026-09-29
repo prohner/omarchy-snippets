@@ -110,17 +110,40 @@ change up as one bounded line.
   through `/proc/self/fd/<fd>`, so the descriptor pins the inode that was
   checked and replacing a path component later cannot redirect anything.
 - The directory must be a real directory, owned by this user, not group- or
-  world-writable, and not a symlink. It is created `0700` if missing.
-- A file is type-checked **before** the open and validated again **on the
-  descriptor** after it. Both earn their place. The check before matters because
-  `open(2)` on a fifo blocks until a writer arrives — a watcher that opened one
-  would stop reporting forever, with nothing on screen to say so. The check
-  after matters because the name is not what gets read; the descriptor is, and
-  only the descriptor can say what was really on the other end of it.
+  world-writable, and not a symlink. It is created `0700` if missing. Bash
+  cannot open with `O_NOFOLLOW`, so it opens `dir/.` — which fails at once on a
+  fifo instead of blocking — and then requires the path, looked at without
+  following it, to be a directory with the same device and inode as the
+  descriptor it now holds. A symlink has an identity of its own and fails that,
+  as does anything swapped in between.
+- **Nothing is checked by name and then opened by name.** Bash can only open a
+  file by name and with no flags — following symlinks, and blocking forever on
+  a fifo — so a check such as `[[ -f name ]]` says nothing about what the open
+  that follows it will get: the name can be swapped in between. Every file
+  operation in these directories goes through `FDIO`, a short perl routine in
+  the helper (perl is already an Omarchy dependency, and already run by
+  `capture.sh`), which:
+  1. opens with `O_NOFOLLOW | O_NONBLOCK`, so a symlink fails the open rather
+     than being followed, and a fifo cannot block it;
+  2. validates the **descriptor** it got: a regular file, owned by this user,
+     with exactly one link — a hard link to some other file of the user's is
+     refused just as a symlink to it would be;
+  3. only then reads, bounded.
 - Anything that is not a plain file this user owns — a fifo, a device, a
-  symlink, a dangling symlink — is refused and reported as unreadable, which the
-  picker says in its header rather than showing an empty library.
+  symlink, a dangling symlink, a hard link — is refused and reported as
+  unreadable, which the picker says in its header rather than showing an empty
+  library.
 - Reads stop at `MAX_FILE_BYTES`.
+- The watcher record in the runtime directory is held to the same rule: it is
+  read through `FDIO`, and reset by unlinking whatever name is there and
+  creating a new file exclusively, so a fifo planted in its place cannot block
+  startup and a symlink cannot make the reset truncate its target.
+
+`test/helper.test.sh` plants each of those before the call, which now reaches
+exactly the code a swap during the call would, and also runs the race itself: a
+swapper replacing the file with a symlink and a fifo while it is read. The
+version before this one, which checked the name and then opened it, leaked the
+symlink's target on 115 reads out of 300.
 
 ## 4. Atomic writes under a retained private directory
 
@@ -130,12 +153,18 @@ write could redirect it.
 
 **Now:** writes go out through the same retained descriptor as reads.
 
-- The temporary file is created by `mktemp` (mode `0600`) in that same
-  directory, addressed through the held descriptor, so the replacement is a
-  `rename(2)` and not a copy, and a reader never sees a partial file.
+- The temporary file is created by `FDIO` with `O_CREAT | O_EXCL | O_NOFOLLOW`
+  (mode `0600`) in that same directory, addressed through the held descriptor,
+  and written through the descriptor that created it — never reopened by name.
+  The replacement is a `rename(2)` and not a copy, so a reader never sees a
+  partial file.
 - `rename(2)` does not follow a symlink at the destination, so a symlink planted
   where the file goes is *replaced by the real file* rather than written
-  through. `test/helper.test.sh` asserts exactly this.
+  through, and it fails onto a directory rather than moving the file into it.
+  `test/helper.test.sh` asserts both.
+- Clipboard captures are held the same way, in a temporary that is unlinked the
+  moment it is created: the capped payload has no name to be swapped, and is
+  handed to `capture.sh` as a descriptor on its stdin.
 - A directory planted at the path after the descriptor was opened receives
   nothing: it is simply not the directory being written to.
 - Saves are coalesced to one in flight (`GuardedWriter.qml`). Both files are

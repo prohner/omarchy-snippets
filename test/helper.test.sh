@@ -104,6 +104,76 @@ ok "$(first_line env -i HOME="$SANDBOX/home" PATH=/usr/bin:/bin XDG_RUNTIME_DIR=
   "a dangling symlink is reported as unreadable, not as absent"
 rm -f "$config/snippets.json"
 
+# --- descriptor validation --------------------------------------------------
+# Nothing is checked by name before it is opened any more: every open is
+# no-follow and nonblocking, and the descriptor is what gets validated. So a
+# file planted before the call reaches exactly the code a file swapped in
+# during it would, and these cases are deterministic rather than races.
+watch_once() { first_line env -i HOME="$SANDBOX/home" PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$SANDBOX/run" \
+  OMARCHY_PATH=/usr/share/omarchy "$HELPER" watch-file snippets; }
+
+printf 'SECRET' > "$SANDBOX/other-file"
+ln -s "$SANDBOX/other-file" "$config/snippets.json"
+ok "$(watch_once)" 'null' "a symlink to another of the user's files is refused, not followed"
+rm -f "$config/snippets.json"
+
+ln "$SANDBOX/other-file" "$config/snippets.json"
+ok "$(watch_once)" 'null' "a hard link to another of the user's files is refused too"
+rm -f "$config/snippets.json"
+
+printf 'h\xc3\xa9llo \xff' > "$config/snippets.json"
+ok "$(watch_once)" '"héllo �"' "UTF-8 survives and a malformed byte becomes U+FFFD, as jq -Rs did"
+rm -f "$config/snippets.json"
+
+# And the race itself, which planting cannot reach: a swapper keeps replacing
+# the file with a symlink to a secret, and with a fifo, while it is read. A
+# helper that checks the name and then opens the name loses this race often —
+# the version before this test leaked the secret on 115 reads out of 300 — and
+# a fifo won at the wrong moment blocks it until the timeout.
+printf 'real' > "$config/snippets.json"
+touch "$config/.race"
+python3 - "$config" "$SANDBOX/other-file" <<'PY' &
+import os, sys, time
+c, secret = sys.argv[1], sys.argv[2]
+tmp, tgt = c + "/.swap", c + "/snippets.json"
+end = time.time() + 120
+while time.time() < end and os.path.exists(c + "/.race"):
+    for make in (lambda: open(tmp, "w").write("real"), lambda: os.symlink(secret, tmp), lambda: os.mkfifo(tmp)):
+        try:
+            if os.path.lexists(tmp): os.unlink(tmp)
+            make(); os.rename(tmp, tgt)
+        except OSError: pass
+PY
+swapper=$!
+leaked=0 blocked=0
+for ((i = 0; i < 20; i++)); do
+  line=$(watch_once)
+  [[ $line == *SECRET* ]] && leaked=$((leaked + 1))
+  [[ -z $line ]] && blocked=$((blocked + 1))
+done
+rm -f "$config/.race"; wait "$swapper" 2>/dev/null
+rm -f "$config/snippets.json" "$config/.swap"
+ok "$leaked" 0 "a file swapped for a symlink mid-read is never followed"
+ok "$blocked" 0 "a file swapped for a fifo mid-read never blocks the watcher"
+
+# The retained directory itself: a fifo swapped in for it must fail the open
+# at once rather than block the watcher.
+mv "$config" "$config.real"
+mkfifo "$config"
+timeout 5 env -i HOME="$SANDBOX/home" PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$SANDBOX/run" \
+  OMARCHY_PATH=/usr/share/omarchy "$HELPER" watch-file snippets >/dev/null 2>&1
+ok "$?" 1 "a fifo in place of the directory is refused at once, not blocked on"
+rm -f "$config"
+mv "$config.real" "$config"
+
+# A directory planted where the file goes must not receive the write.
+mkdir "$config/snippets.json"
+printf 'PAYLOAD' | run write-file snippets 2>/dev/null
+ok "$?" 1 "a directory at the destination makes the write fail"
+ok "$(ls -A "$config/snippets.json" | wc -l)" 0 "and nothing is moved into it"
+ok "$(ls -A "$config" | grep -c '^\.snippets\.json\.' || true)" 0 "and no temporary is left behind"
+rmdir "$config/snippets.json"
+
 # --- clipboard capture caps -------------------------------------------------
 # Driven the way wl-paste drives it: payload on stdin, mime as the argument.
 capped=$(head -c 200000 /dev/zero | tr '\0' 'T' | run capture-stream text)
@@ -118,8 +188,16 @@ ok "$(printf '%s' "$short" | python3 -c 'import json,sys; print(json.load(sys.st
 oversized_image=$(head -c 70000000 /dev/zero | run capture-stream image/png)
 ok "$oversized_image" "" "an image past the cap is dropped, because half a PNG is a corrupt file"
 
-ok "$(ls -A "$SANDBOX/run/omarchy-snippets" | grep -c '^capture\.' || true)" 0 \
+ok "$(ls -A "$SANDBOX/run/omarchy-snippets" | grep -c 'capture\.' || true)" 0 \
   "no capture temporaries are left behind"
+
+# An image under the cap has to reach capture.sh intact through the unlinked
+# temporary: a short PNG signature comes back as an image entry.
+png=$(printf '\x89PNG\r\n\x1a\n0123456789' | run capture-stream image/png)
+ok "$(printf '%s' "$png" | python3 -c 'import json,sys; print(json.load(sys.stdin)["type"])')" image \
+  "an image under the cap reaches capture.sh"
+ok "$(find "$SANDBOX/home/.local/state/omarchy/clipboard-images" -type f -size 18c | wc -l)" 1 \
+  "byte for byte"
 
 # --- watcher identity -------------------------------------------------------
 # The property being tested is the one the old `pkill -f` could not have: a
@@ -145,6 +223,29 @@ ok "$(alive "$lookalike")" "alive" "a process that merely matches the old pkill 
 ok "$(stat -c %s "$SANDBOX/run/omarchy-snippets/watchers")" 0 "the record is cleared after reaping"
 kill -TERM "$ours" "$lookalike" 2>/dev/null
 wait 2>/dev/null
+
+# The watcher record, planted with the things a check-then-open cannot survive.
+record=$SANDBOX/run/omarchy-snippets/watchers
+rm -f "$record"
+mkfifo "$record"
+timeout 5 env -i HOME="$SANDBOX/home" PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$SANDBOX/run" \
+  OMARCHY_PATH=/usr/share/omarchy "$HELPER" reap
+ok "$?" 0 "a fifo in place of the watcher record does not block startup"
+ok "$(stat -c %F "$record")" "regular empty file" "and is replaced by an empty record"
+
+printf 'KEEP ME\n' > "$SANDBOX/other-file"
+rm -f "$record"
+ln -s "$SANDBOX/other-file" "$record"
+run reap
+ok "$(cat "$SANDBOX/other-file")" "KEEP ME" "resetting the record never truncates through a symlink"
+ok "$(stat -c %F "$record")" "regular empty file" "the symlink is replaced instead"
+
+rm -f "$record"
+ln -s "$SANDBOX/other-file" "$record"
+first_line env -i HOME="$SANDBOX/home" PATH=/usr/bin:/bin XDG_RUNTIME_DIR="$SANDBOX/run" \
+  OMARCHY_PATH=/usr/share/omarchy "$HELPER" watch-file snippets >/dev/null
+ok "$(cat "$SANDBOX/other-file")" "KEEP ME" "recording a watcher never appends through a symlink"
+rm -f "$record"
 
 if (( failures == 0 )); then
   printf '\nAll tests passed.\n'

@@ -18,8 +18,11 @@
 #     in time here, by the producer, before the shell allocates for it.
 #   * The two JSON files are reached through a descriptor to their directory
 #     that is opened once and retained, so no component of the path can be
-#     swapped afterwards to redirect a read or a write, and reads are validated
-#     on the descriptor actually being read rather than on a name.
+#     swapped afterwards to redirect a read or a write.
+#   * No file in those directories is ever checked by name and then opened by
+#     name. Every open is no-follow and nonblocking, and the descriptor it
+#     returns is what gets validated before a byte is read or written (see
+#     FDIO below).
 #   * Stale watchers are killed by recorded (pid, start time, cmdline) identity.
 #     Nothing here ever matches a command line with a pattern.
 #
@@ -50,7 +53,7 @@ umask 077
 unset -v BASH_ENV ENV CDPATH GLOBIGNORE POSIXLY_CORRECT \
   LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG LD_ASSUME_KERNEL \
   PERL5LIB PERL5OPT PERLLIB PERL5DB PERLIO PERL_UNICODE 2>/dev/null
-unset -f cat head stat mv rm mkdir mktemp jq sleep timeout tr kill printf 2>/dev/null
+unset -f cat head stat mv rm mkdir mktemp jq sleep timeout tr kill printf perl 2>/dev/null
 export PATH=/usr/bin:/bin
 
 readonly SELF_UID=$EUID
@@ -76,16 +79,6 @@ readonly SENTINEL_ABSENT='""'
 die() {
   printf 'omarchy-snippets-helper: %s\n' "$*" >&2
   exit 1
-}
-
-# Set by whichever subcommand creates a temporary file. The EXIT trap that
-# removes it runs after the function that set it has already returned, so this
-# is a global with a default rather than a local that would be gone by then.
-SCRATCH_FILE=
-
-drop_scratch() {
-  [[ -n ${SCRATCH_FILE:-} ]] && "$RM" -f -- "$SCRATCH_FILE" 2>/dev/null
-  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -164,15 +157,12 @@ need() {
 
 # Programs resolved lazily, per subcommand, so a missing optional one never
 # stops a subcommand that does not use it.
-JQ= TR= SLEEP= TIMEOUT= TRUNCATE= WL_PASTE= SETPRIV=
+JQ= TR= SLEEP= TIMEOUT= WL_PASTE= SETPRIV=
 OMARCHY_ROOT=
 
-need CAT cat
 need HEAD head
 need MKDIR mkdir
-need MKTEMP mktemp
-need MV mv
-need RM rm
+need PERL perl
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -237,11 +227,21 @@ open_private_dir() {
     [[ ! -e $dir && ! -L $dir ]] || die "in the way and not a directory: $dir"
     "$MKDIR" -m 700 -p -- "$dir" || die "cannot create $dir"
   fi
-  [[ ! -L $dir ]] || die "refusing to use a symlinked directory: $dir"
 
-  exec {fd}< "$dir" || die "cannot open $dir"
+  # Opened as "$dir/." so that a fifo swapped in at the path fails the open at
+  # once instead of blocking it. Bash cannot open with O_NOFOLLOW, so the
+  # no-symlink rule is enforced after the open instead of before it: the path,
+  # looked at without following it, must be a directory with the same identity
+  # as the one the descriptor holds. A symlink has an identity of its own and
+  # fails that, and so does anything swapped in between the open and the look.
+  exec {fd}< "$dir/." || die "cannot open $dir"
   DIR_FD=$fd
   DIR_REF=/proc/self/fd/$fd
+
+  local held path_now
+  held=$("$STAT" -L -c '%d:%i' -- "$DIR_REF" 2>/dev/null) || die "cannot stat $dir"
+  path_now=$("$STAT" -c '%F|%d:%i' -- "$dir" 2>/dev/null) || die "cannot stat $dir"
+  [[ $path_now == "directory|$held" ]] || die "refusing to use a symlinked or swapped directory: $dir"
 
   IFS='|' read -r kind owner mode < <("$STAT" -L -c '%F|%u|%a' -- "$DIR_REF" 2>/dev/null) \
     || die "cannot stat $dir"
@@ -250,40 +250,184 @@ open_private_dir() {
   (( (8#$mode & 8#022) == 0 )) || die "$dir is writable by group or other"
 }
 
-FILE_FD=
-
-# open_checked_file <name> — open <name> inside the retained directory and
-# validate the descriptor that was actually opened, not the name that was used
-# to open it. Returns 0 with FILE_FD set, 2 when the file is absent, 1 when it
-# is present but is not a plain file this user owns.
+# ---------------------------------------------------------------------------
+# Descriptor-safe file operations
+# ---------------------------------------------------------------------------
+# Bash can open a file only by name, with no flags: `exec {fd}< name` follows a
+# symlink, and blocks forever on a fifo until a writer arrives. So a check done
+# by name — `[[ -f name ]]` — says nothing about what the open that follows it
+# will get, because the name can be swapped in between.
 #
-# The type is tested before the open and again on the descriptor afterwards,
-# and both tests earn their place. The one before matters because open(2) on a
-# fifo blocks until a writer arrives: a watcher that opened one would stop
-# reporting forever, with nothing to show for it. The one after matters because
-# the name is not what gets read — the descriptor is — and only the descriptor
-# can say what was really on the other end of it.
-open_checked_file() {
-  local name=$1 fd kind owner
-  if [[ ! -e $DIR_REF/$name ]]; then
-    # A dangling symlink is not an absent file; it is a planted one.
-    [[ -L $DIR_REF/$name ]] && return 1
-    return 2
-  fi
-  [[ ! -L $DIR_REF/$name ]] || return 1
-  [[ -f $DIR_REF/$name ]] || return 1
+# Every file operation inside the retained directories goes through FDIO
+# instead, which is perl because perl is already an Omarchy dependency and
+# already run by capture.sh, and because it can pass open(2) the flags bash
+# cannot. The rule it enforces, for every operation:
+#
+#   1. open with O_NOFOLLOW | O_NONBLOCK, so a symlink fails the open rather
+#      than being followed, and a fifo cannot block it;
+#   2. validate the descriptor that was opened: a regular file, owned by this
+#      user, with exactly one link — a hard link to some other file of the
+#      user's is refused like a symlink to it would be;
+#   3. only then read or write, bounded.
+#
+# Nothing is ever checked by name and then opened by name. Temporaries are
+# created O_EXCL and written through the descriptor that created them.
+#
+#   read-json <path> <max>   one line: the file as a JSON string, "" when absent,
+#                            null when it is not a plain file this user owns
+#   read <path> <max>        the file's bytes; exit 2 absent, 1 refused
+#   append <path> <text>     append to the file, creating it if absent
+#   reset <path>             replace whatever is at <path> with an empty file
+#   replace <dir> <name> <max>
+#                            stdin, capped, into a new file that is renamed
+#                            over <dir>/<name>
+#   capture <dir> <max> <drop> <command…>
+#                            stdin, capped, into an unlinked temporary that
+#                            becomes <command>'s stdin; past <max> it is
+#                            truncated, or dropped when <drop> is 1
+read -r -d '' FDIO <<'PERL' || true
+use strict;
+use warnings;
+use Fcntl qw(O_RDONLY O_WRONLY O_RDWR O_CREAT O_EXCL O_APPEND O_NOFOLLOW O_NONBLOCK S_ISREG);
+use Errno qw(ENOENT EEXIST);
 
-  exec {fd}< "$DIR_REF/$name" 2>/dev/null || return 1
-  IFS='|' read -r kind owner < <("$STAT" -L -c '%F|%u' -- "/proc/self/fd/$fd" 2>/dev/null) || {
-    exec {fd}<&-
-    return 1
+my $op = shift(@ARGV) // "";
+my $uid = $>;
+my $chunk = 65536;
+
+# The descriptor, not the name: a plain file, ours, and the only name it has.
+sub fits {
+  my @st = stat($_[0]) or return 0;
+  return S_ISREG($st[2]) && $st[4] == $uid && $st[3] == 1;
+}
+
+# 1 opened and valid, 0 absent, -1 present but refused.
+sub open_checked {
+  my ($path, $flags, $mode) = @_;
+  my $fh;
+  unless (sysopen($fh, $path, $flags | O_NOFOLLOW | O_NONBLOCK, $mode // 0600)) {
+    return ($!{ENOENT} ? 0 : -1, undef);
   }
-  if [[ $kind != "regular file" || $owner != "$SELF_UID" ]]; then
-    exec {fd}<&-
-    return 1
-  fi
-  FILE_FD=$fd
-  return 0
+  return (1, $fh) if fits($fh);
+  close($fh);
+  return (-1, undef);
+}
+
+sub copy_capped {
+  my ($in, $out, $max) = @_;
+  my $total = 0;
+  while ($total < $max) {
+    my $want = $max - $total < $chunk ? $max - $total : $chunk;
+    my $got = sysread($in, my $buf, $want);
+    die "read failed: $!\n" unless defined $got;
+    last if $got == 0;
+    for (my $off = 0; $off < $got;) {
+      my $wrote = syswrite($out, $buf, $got - $off, $off);
+      die "write failed: $!\n" unless defined $wrote;
+      $off += $wrote;
+    }
+    $total += $got;
+  }
+  return $total;
+}
+
+# Read the rest of stdin away: stopping at a cap and closing would SIGPIPE the
+# producer, which for wl-paste means a broken watcher, not a truncated entry.
+sub drain { 1 while sysread(STDIN, my $buf, $chunk) }
+
+# A new file, created exclusively, never following a name someone else put
+# there first.
+sub create_temp {
+  my ($dir, $stem) = @_;
+  for (1 .. 64) {
+    my $path = sprintf("%s/.%s.%08x%08x", $dir, $stem, int(rand(4294967296)), int(rand(4294967296)));
+    my $fh;
+    return ($fh, $path) if sysopen($fh, $path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    return () unless $!{EEXIST};
+  }
+  return ();
+}
+
+if ($op eq "read-json" || $op eq "read") {
+  my ($path, $max) = @ARGV;
+  my ($status, $fh) = open_checked($path, O_RDONLY);
+  if ($op eq "read") {
+    exit($status == 0 ? 2 : 1) if $status != 1;
+    binmode(STDOUT);
+    copy_capped($fh, \*STDOUT, $max);
+    exit 0;
+  }
+  if ($status == 0) { print "\"\"\n"; exit 0 }
+  if ($status < 0) { print "null\n"; exit 0 }
+  my $raw = "";
+  while (length($raw) < $max) {
+    my $got = sysread($fh, $raw, $max - length($raw) < $chunk ? $max - length($raw) : $chunk, length($raw));
+    last unless $got;
+  }
+  require Encode;
+  require JSON::PP;
+  my $text = Encode::decode("UTF-8", $raw);
+  print JSON::PP->new->utf8->allow_nonref->encode($text), "\n";
+  exit 0;
+}
+
+if ($op eq "append") {
+  my ($path, $text) = @ARGV;
+  my ($status, $fh) = open_checked($path, O_WRONLY | O_APPEND | O_CREAT);
+  exit 1 unless $status == 1;
+  defined(syswrite($fh, $text)) or exit 1;
+  exit 0;
+}
+
+if ($op eq "reset") {
+  my ($path) = @ARGV;
+  # unlink(2) removes a name without following it, whatever it names.
+  unlink($path) or $!{ENOENT} or exit 1;
+  sysopen(my $fh, $path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or exit 1;
+  exit 0;
+}
+
+if ($op eq "replace") {
+  my ($dir, $name, $max) = @ARGV;
+  my ($fh, $tmp) = create_temp($dir, $name) or exit 1;
+  my $ok = eval { copy_capped(\*STDIN, $fh, $max); 1 };
+  drain();
+  # rename(2) never follows a symlink at the destination, and fails onto a
+  # directory rather than moving the file into it.
+  if (!$ok || !close($fh) || !rename($tmp, "$dir/$name")) {
+    unlink($tmp);
+    exit 1;
+  }
+  exit 0;
+}
+
+if ($op eq "capture") {
+  my ($dir, $max, $drop, @command) = @ARGV;
+  exit 0 unless @command;
+  my ($fh, $tmp) = create_temp($dir, "capture") or exit 0;
+  # Unlinked at once: the payload has no name from here on, so nothing can be
+  # swapped for it, and nothing is left behind however this process ends.
+  unlink($tmp);
+  my $size = eval { copy_capped(\*STDIN, $fh, $max + 1) };
+  drain();
+  exit 0 unless defined $size;
+  if ($size > $max) {
+    exit 0 if $drop;
+    truncate($fh, $max) or exit 0;
+  }
+  sysseek($fh, 0, 0) or exit 0;
+  open(STDIN, "<&", $fh) or exit 0;
+  close($fh);
+  exec { $command[0] } @command;
+  exit 0;
+}
+
+die "fdio: unknown operation '$op'\n";
+PERL
+readonly FDIO
+
+fdio() {
+  "$PERL" -e "$FDIO" "$@"
 }
 
 # emit_file <name> — one line on stdout: the file's contents as a JSON string
@@ -292,16 +436,7 @@ open_checked_file() {
 # what the file holds, so the reader's line splitter can never be starved by
 # content that happens to contain no newline.
 emit_file() {
-  local name=$1 rc=0
-  open_checked_file "$name" || rc=$?
-  case $rc in
-    0)
-      "$HEAD" -c "$MAX_FILE_BYTES" <&"$FILE_FD" | "$JQ" -Rs .
-      exec {FILE_FD}<&-
-      ;;
-    2) printf '%s\n' "$SENTINEL_ABSENT" ;;
-    *) printf '%s\n' "$SENTINEL_UNREADABLE" ;;
-  esac
+  fdio read-json "$DIR_REF/$1" "$MAX_FILE_BYTES"
 }
 
 # file_signature <name> — cheap identity of the file as it is right now.
@@ -309,19 +444,6 @@ emit_file() {
 # in-place edit.
 file_signature() {
   "$STAT" -c '%d:%i:%s:%.9Y' -- "$DIR_REF/$1" 2>/dev/null || printf -- '-'
-}
-
-# ---------------------------------------------------------------------------
-# Bounded input
-# ---------------------------------------------------------------------------
-# read_capped <dest> <max> — copy at most <max> bytes of stdin into <dest>,
-# then read the rest away. Draining matters: stopping at the cap and closing
-# would SIGPIPE the producer, which for wl-paste means a broken watcher rather
-# than a truncated entry.
-read_capped() {
-  local dest=$1 max=$2
-  "$HEAD" -c "$max" > "$dest"
-  "$CAT" > /dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -358,7 +480,7 @@ proc_is_ours() {
 record_identity() {
   local kind=$1 pid=$2 start
   start=$(proc_starttime "$pid") || return 0
-  printf '%s %s %s\n' "$kind" "$pid" "$start" >> "$DIR_REF/$WATCHERS_FILE"
+  fdio append "$DIR_REF/$WATCHERS_FILE" "$kind $pid $start"$'\n'
 }
 
 # ---------------------------------------------------------------------------
@@ -376,20 +498,22 @@ cmd_reap() {
   need TR tr
   open_private_dir "$RUNTIME_DIR"
 
-  local record=$DIR_REF/$WATCHERS_FILE kind pid start now
-  if [[ -f $record ]]; then
-    while read -r kind pid start; do
-      [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || continue
-      now=$(proc_starttime "$pid") || continue
-      [[ $now == "$start" ]] || continue
-      proc_is_ours "$pid" || continue
-      case $kind in
-        group) kill -TERM -- "-$pid" 2>/dev/null ;;
-        proc) kill -TERM -- "$pid" 2>/dev/null ;;
-      esac
-    done < "$record"
-  fi
-  : > "$DIR_REF/$WATCHERS_FILE"
+  local kind pid start now
+  # The record is read through FDIO like everything else, so a fifo or a
+  # symlink planted in its place is refused instead of blocking startup or
+  # being read, and resetting it replaces whatever is there instead of
+  # truncating through it.
+  while read -r kind pid start; do
+    [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || continue
+    now=$(proc_starttime "$pid") || continue
+    [[ $now == "$start" ]] || continue
+    proc_is_ours "$pid" || continue
+    case $kind in
+      group) kill -TERM -- "-$pid" 2>/dev/null ;;
+      proc) kill -TERM -- "$pid" 2>/dev/null ;;
+    esac
+  done < <(fdio read "$DIR_REF/$WATCHERS_FILE" 65536)
+  fdio reset "$DIR_REF/$WATCHERS_FILE"
 }
 
 # bind_to_shell <subcommand> [args…] — re-exec through setpriv so the kernel
@@ -474,10 +598,10 @@ cmd_watch_clipboard() {
 # over the cap is dropped, because half a PNG on disk is not an image, it is a
 # corrupt file the picker would offer forever.
 capture_payload() {
-  local mime=$1 max tmp size out
+  local mime=$1 max drop out
   case $mime in
-    text) max=$MAX_CLIP_TEXT_BYTES ;;
-    image/*) max=$MAX_CLIP_IMAGE_BYTES ;;
+    text) max=$MAX_CLIP_TEXT_BYTES; drop=0 ;;
+    image/*) max=$MAX_CLIP_IMAGE_BYTES; drop=1 ;;
     *) return 0 ;;
   esac
 
@@ -486,24 +610,14 @@ capture_payload() {
   _safe_exec "$capture_script" || die "refusing to run $capture_script"
 
   need TIMEOUT timeout
-  need TRUNCATE truncate
   open_private_dir "$RUNTIME_DIR"
-  tmp=$("$MKTEMP" -- "$DIR_REF/capture.XXXXXXXX") || return 0
-  SCRATCH_FILE=$tmp
-  trap drop_scratch EXIT
 
-  read_capped "$tmp" "$((max + 1))"
-  size=$("$STAT" -L -c '%s' -- "$tmp" 2>/dev/null) || return 0
-  if (( size > max )); then
-    case $mime in
-      image/*) return 0 ;;
-      *) "$TRUNCATE" -s "$max" -- "$tmp" || return 0 ;;
-    esac
-  fi
-
-  # capture.sh still runs its own sensitive-clipboard and password-manager
-  # checks; CLIPBOARD_STATE reaches it because wl-paste sets it on us.
-  out=$("$TIMEOUT" -k 2 "$CAPTURE_DEADLINE" "$capture_script" "$mime" < "$tmp" \
+  # FDIO holds the capped payload in an unlinked temporary and hands that
+  # descriptor to capture.sh as its stdin. capture.sh still runs its own
+  # sensitive-clipboard and password-manager checks; CLIPBOARD_STATE reaches it
+  # because wl-paste sets it on us.
+  out=$(fdio capture "$DIR_REF" "$max" "$drop" \
+      "$TIMEOUT" -k 2 "$CAPTURE_DEADLINE" "$capture_script" "$mime" \
     | "$HEAD" -c "$MAX_CAPTURE_OUTPUT_BYTES" | "$HEAD" -n 1) || out=
   [[ -n $out ]] && printf '%s\n' "$out"
   return 0
@@ -601,21 +715,11 @@ cmd_watch_file() {
 # through the retained descriptor, a directory planted at the path afterwards
 # receives nothing.
 cmd_write_file() {
-  local tmp
   resolve_managed_file "${1:-}"
   open_private_dir "$MANAGED_DIR"
 
-  tmp=$("$MKTEMP" -- "$DIR_REF/.$MANAGED_NAME.XXXXXXXX") || die "cannot create a temporary file in $MANAGED_DIR"
-  SCRATCH_FILE=$tmp
-  trap drop_scratch EXIT
-
-  read_capped "$tmp" "$MAX_FILE_BYTES"
-
-  # rename(2) does not follow a symlink at the destination, so a planted link
-  # is replaced by the real file rather than written through.
-  "$MV" -f -- "$tmp" "$DIR_REF/$MANAGED_NAME" || die "cannot write $MANAGED_DIR/$MANAGED_NAME"
-  SCRATCH_FILE=
-  trap - EXIT
+  fdio replace "$DIR_REF" "$MANAGED_NAME" "$MAX_FILE_BYTES" \
+    || die "cannot write $MANAGED_DIR/$MANAGED_NAME"
 }
 
 # run <helper> [args…] — exec one of Omarchy's own helpers.
