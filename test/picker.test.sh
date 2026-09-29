@@ -97,6 +97,8 @@ run() { # locale, expected decimal mark
   local answer=42
   check "Enter asked for the answer to be pasted" "run paste-text --shift-insert $answer"
   check "Shift+Enter asked for it to be copied" "run paste-text --copy-only $answer"
+  check "Ctrl+C asked for the formula, as typed, to be copied" "run paste-text --copy-only =sqrt(16) * 3"
+  refute "Ctrl+C during a search copied nothing" "--copy-only hello"
   refute "Alt+Enter on an answer opened nothing" "run open-entry"
   refute "Delete on an answer wrote no history" "write-file history"
 }

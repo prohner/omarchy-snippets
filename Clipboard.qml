@@ -275,6 +275,16 @@ Item {
     return true
   }
 
+  // +calculator: Ctrl+C copies the formula itself, exactly as typed, rather
+  // than its answer — to keep it, or to carry it somewhere else. Only while
+  // the box holds a calculation; during a search it does nothing.
+  function copyFormula() {
+    if (Calculator.evaluate(root.filterText, root.calcOptions) === null) return false
+    root.opened = false
+    root.runDetached(["run", "paste-text", "--copy-only", root.filterText])
+    return true
+  }
+
   // Hands the raw file to the user's editor in a terminal. The helper watches
   // the path, so saving in $EDITOR refreshes the picker with no further action.
   //
@@ -688,6 +698,13 @@ Item {
             return
           }
 
+          // +calculator: copy the formula typed so far.
+          if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_C) {
+            root.copyFormula()
+            event.accepted = true
+            return
+          }
+
           if (event.key === Qt.Key_Escape) {
             if (root.filterText) root.setFilter("")
             else root.close()
@@ -1012,7 +1029,7 @@ Item {
                 Text {
                   textFormat: Text.PlainText
                   width: parent.width
-                  text: "Enter pastes · Shift+Enter copies · = keeps calculating"
+                  text: "Enter pastes · Shift+Enter copies the answer\nCtrl+C copies the formula · = keeps calculating"
                   color: root.foreground
                   opacity: 0.45
                   font.family: root.fontFamily

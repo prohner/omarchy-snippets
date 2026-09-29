@@ -60,6 +60,7 @@ way it does in [Alfred](https://www.alfredapp.com/help/features/calculator/).
 ![Calculator](docs/calculator.png)
 
 - **Enter** pastes the answer, **Shift+Enter** copies it
+- **Ctrl+C** copies the formula itself, exactly as typed, `=` prefix and all
 - **`=`** at the end swaps the expression for its answer, so you can keep going:
   `2+2` `=` gives `4`, then type `*3`
 - **`+ - * / ^`** and parentheses, with the usual precedence. `**`, `×`, `÷` work
@@ -104,6 +105,7 @@ In the picker:
 - **Shift+Enter** copies it without pasting
 - **Alt+Enter** edits a snippet, or opens a history entry externally
 - **=** after a calculation replaces it with its answer
+- **Ctrl+C** copies the calculation you typed, rather than its answer
 - **Ctrl+E** opens the snippet editor
 - **Delete** removes a clipboard entry (snippets are deleted from the editor)
 - **Escape** clears the search, then closes

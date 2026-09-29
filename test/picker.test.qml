@@ -115,6 +115,13 @@ ShellRoot {
         plugin.activateIndex(0)
         break
 
+      case 8:
+        plugin.setFilter("hello")
+        root.ok(!plugin.copyFormula(), "Ctrl+C during a search copies nothing")
+        plugin.setFilter("=sqrt(16) * 3")
+        root.ok(plugin.copyFormula(), "Ctrl+C copies the formula")
+        break
+
       case 12:
         // Leave the detached stub time to write its log.
         console.log(root.failures === 0 ? "\nAll tests passed." : "\n" + root.failures + " failed.")
