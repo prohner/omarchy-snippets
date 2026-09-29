@@ -339,7 +339,7 @@ the same ones.
 ### Staying current with upstream
 
 `Clipboard.qml` is a fork of Omarchy's built-in clipboard overlay, tracking
-**Omarchy 4.0.3-1** (the overlay is unchanged from 4.0.2-1, which it was first
+**Omarchy 4.0.4-1** (the overlay is unchanged from 4.0.2-1, which it was first
 forked from). Feature additions live in files upstream does not have
 (`Snippets.js`, `Calculator.js`, `SnippetsEditor.qml`, `SnippetTextArea.qml`,
 `GuardedWriter.qml`, `bin/omarchy-snippets-helper`), and every deviation inside

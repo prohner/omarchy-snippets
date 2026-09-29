@@ -8,7 +8,7 @@ import "ClipboardHistory.js" as ClipboardHistory
 import "Snippets.js" as Snippets // +snippets
 import "Calculator.js" as Calculator // +calculator
 
-// FORK of the built-in omarchy.clipboard overlay (Omarchy 4.0.3-1; the
+// FORK of the built-in omarchy.clipboard overlay (Omarchy 4.0.4-1; the
 // overlay is unchanged from 4.0.2-1, which it was first forked from).
 //
 // Every deviation from upstream is marked `+snippets`, `+calculator`, or
