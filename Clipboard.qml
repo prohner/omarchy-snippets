@@ -105,16 +105,16 @@ Item {
   property int cardHeight: Math.min(Style.space(600), panel.height - Style.gapsOut * 2)
   property int rowHeight: Math.max(Style.space(50), Style.font.body + Style.font.caption + Style.spacing.rowPaddingX * 2)
   property int historyLimit: 300
-
   function open(payloadJson) {
     root.opened = true
     root.filterText = ""
+    searchInput.text = "" // +ime: the search line is its own TextInput
     root.selectedIndex = 0
     root.cursorActive = true
     root.editorOpen = false // +snippets
     root.disarmPointer()
     root.rebuildDisplay()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    root.focusSearch() // +ime: the search line takes the keyboard
   }
 
   function close() {
@@ -253,7 +253,7 @@ Item {
     root.editorOpen = false
     root.cursorActive = root.displayCount() > 0
     root.rebuildDisplay()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    root.focusSearch() // +ime
   }
 
   function displayCount() {
@@ -308,7 +308,7 @@ Item {
   function cancelClearHistory() {
     root.clearConfirmOpen = false
     root.disarmPointer()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    root.focusSearch() // +ime
   }
 
   function confirmClearHistory() {
@@ -319,7 +319,7 @@ Item {
     root.disarmPointer()
     root.clearConfirmOpen = false
     root.rebuildDisplay()
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    root.focusSearch() // +ime
   }
 
   function removeDisplayIndex(index) {
@@ -407,8 +407,18 @@ Item {
     resultList.positionViewAtIndex(root.selectedIndex, ListView.Contain)
   }
 
+  // +ime: the search line is a real TextInput (qs.Ui.FilterInput) so an input
+  // method can compose into it — Qt hands fcitx5's Chinese, Japanese or Korean
+  // text only to text-input items, never to Keys.onPressed. filterText stays the
+  // source of truth and the field follows it, so every other path that rewrites
+  // the query (Escape, `=` swapping in an answer, opening the picker) agrees.
+  function focusSearch() {
+    Qt.callLater(function() { if (!root.editorOpen) searchInput.forceActiveFocus() })
+  }
+
   function setFilter(nextFilter) {
     root.filterText = nextFilter
+    if (searchInput.text !== nextFilter) searchInput.text = nextFilter
     root.selectedIndex = 0
     root.cursorActive = true
     root.disarmPointer()
@@ -674,7 +684,7 @@ Item {
         id: keyCatcher
         anchors.fill: parent
         z: root.clearConfirmOpen ? 20 : 0
-        focus: !root.editorOpen // +snippets: yield the keyboard to the editor
+        focus: false // +ime: the search line holds the focus and forwards keys here
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
@@ -706,12 +716,26 @@ Item {
             return
           }
 
+          // +calculator: `=` swaps the expression for its answer. The branch is
+          // kept ahead of the chain now that a TextInput would otherwise take
+          // the character itself, and it is still only consumed when the box
+          // holds a calculation.
+          if (event.text === "=" && root.continueCalculation()) {
+            event.accepted = true
+            return
+          }
+
           if (event.key === Qt.Key_Escape) {
             if (root.filterText) root.setFilter("")
             else root.close()
             event.accepted = true
-          } else if (Util.editsFilter(event, root.filterText)) {
-            root.setFilter(Util.editedFilter(event, root.filterText))
+          } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_U) {
+            // Qt Quick's TextInput has no clear-line chord of its own.
+            root.setFilter("")
+            event.accepted = true
+          } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_Backspace) {
+            // ...nor word delete, which Util.editedFilter used to supply.
+            root.setFilter(root.filterText.replace(/\s+$/, "").replace(/\S+$/, ""))
             event.accepted = true
           } else if (event.key === Qt.Key_Delete) {
             if (event.modifiers & Qt.ShiftModifier) root.requestClearHistory()
@@ -741,11 +765,9 @@ Item {
             else if (root.cursorActive) root.activateIndex(root.selectedIndex)
             else if (displayModel.count > 0) root.cursorActive = true
             event.accepted = true
-          } else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && event.text.charCodeAt(0) !== 127) {
-            if (event.text === "=" && root.continueCalculation()) { event.accepted = true; return } // +calculator
-            root.setFilter(root.filterText + event.text)
-            event.accepted = true
           }
+          // +ime: characters and plain Backspace are left unaccepted, so
+          // they reach the search line and an input method can compose them.
         }
 
         ConfirmDialog {
@@ -810,16 +832,42 @@ Item {
           radius: root.cornerRadius
           color: "transparent"
 
-          Text {
-            textFormat: Text.PlainText
+          // +ime: a TextInput rather than a Text fed by key presses, so an input
+          // method can compose into it. Whatever it leaves unaccepted is
+          // forwarded to keyCatcher, which keeps every shortcut where it was.
+          FilterInput {
+            id: searchInput
             anchors.left: parent.left
             anchors.right: hint.left // +snippets: leave room for the hint
             anchors.rightMargin: Style.space(10)
             anchors.verticalCenter: parent.verticalCenter
-            // +snippets +calculator: say what the box does besides history.
-            text: root.filterText || "Search clipboard and snippets, or calculate…"
+            keyHandler: keyCatcher
+            // The confirm dialog and the editor own the keyboard, and an input
+            // method commit bypasses key handling: refuse it here instead.
+            readOnly: root.clearConfirmOpen || root.editorOpen
+            focus: !root.editorOpen
             color: root.foreground
-            opacity: root.filterText ? 1 : 0.58
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.heading
+            onTextChanged: if (text !== root.filterText) root.setFilter(text)
+            // Ui/FilterInput accepts every Alt/Meta chord, which would swallow
+            // Alt+Enter (open the row) before keyCatcher ever sees it. Refuse
+            // only the chords that carry text.
+            Keys.onPressed: function(event) {
+              if ((event.modifiers & (Qt.AltModifier | Qt.MetaModifier)) && event.text.length > 0) event.accepted = true
+            }
+          }
+
+          // +snippets +calculator: say what the box does besides history.
+          Text {
+            textFormat: Text.PlainText
+            anchors.fill: searchInput
+            verticalAlignment: Text.AlignVCenter
+            // Kept out of the way while an input method is composing.
+            visible: !root.filterText && !searchInput.preeditText
+            text: "Search clipboard and snippets, or calculate…"
+            color: root.foreground
+            opacity: 0.58
             font.family: root.fontFamily
             font.pixelSize: Style.font.heading
             elide: Text.ElideRight
